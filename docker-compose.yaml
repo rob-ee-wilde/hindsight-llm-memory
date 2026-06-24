@@ -1,0 +1,59 @@
+# Hindsight on Dokploy - external PostgreSQL (pgvector) + standalone app image.
+# Deploy as a Dokploy "Compose" service from this branch. Set the variables below
+# in the Dokploy "Environment" tab (NOT in this file). See README.md for full steps.
+#
+# The image is the upstream-published standalone build:
+#   REST/MCP API on :8888 + Control Plane UI on :9999, in one container.
+# Pin HINDSIGHT_VERSION to a released tag for production; default is :latest.
+
+services:
+  db:
+    image: pgvector/pgvector:pg18
+    restart: always
+    environment:
+      POSTGRES_USER: ${HINDSIGHT_DB_USER:-hindsight_user}
+      POSTGRES_PASSWORD: ${HINDSIGHT_DB_PASSWORD}
+      POSTGRES_DB: ${HINDSIGHT_DB_NAME:-hindsight_db}
+    volumes:
+      - pg_data:/var/lib/postgresql/18/docker   # PG18 data-dir layout
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${HINDSIGHT_DB_USER:-hindsight_user} -d ${HINDSIGHT_DB_NAME:-hindsight_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_API_LLM_PROVIDER:-openai}
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY}
+      HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_API_LLM_MODEL:-gpt-4o-mini}
+      HINDSIGHT_API_DATABASE_URL: postgresql://${HINDSIGHT_DB_USER:-hindsight_user}:${HINDSIGHT_DB_PASSWORD}@db:5432/${HINDSIGHT_DB_NAME:-hindsight_db}
+      HINDSIGHT_CP_ACCESS_KEY: ${HINDSIGHT_CP_ACCESS_KEY:-}
+      HINDSIGHT_API_MCP_AUTH_TOKEN: ${HINDSIGHT_API_MCP_AUTH_TOKEN:-}
+    expose:
+      - "8888"
+      - "9999"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8888/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+    networks:
+      - internal
+      - dokploy-network
+
+volumes:
+  pg_data:
+
+networks:
+  internal:
+  dokploy-network:
+    external: true
