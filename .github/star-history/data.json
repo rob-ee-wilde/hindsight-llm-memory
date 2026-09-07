@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "repository": "vectorize-io/hindsight",
+  "repository": "rob-ee-wilde/hindsight-llm-memory",
   "backfilledAt": "2026-08-03T10:36:26.721Z",
   "backfill": [
     {
@@ -1120,6 +1120,10 @@
     {
       "date": "2026-09-06",
       "stars": 22703
+    },
+    {
+      "date": "2026-09-07",
+      "stars": 0
     }
   ]
 }
