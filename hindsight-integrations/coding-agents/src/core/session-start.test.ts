@@ -1,20 +1,72 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildSessionStartContext, runSessionStartHook } from "./session-start";
 import { resolveConfig } from "./config";
+import { repoNameOf } from "./git";
 import { HOOK_HARNESSES } from "../harness/hook-lifecycle";
+import type { RawConfig } from "./config";
+
+/** The SessionStart event `runSessionStartHook` reads from fd 0; every other read stays real. */
+let stdin = "";
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    readFileSync: (target: unknown, ...rest: unknown[]) =>
+      target === 0 ? stdin : (actual.readFileSync as (...a: unknown[]) => unknown)(target, ...rest),
+  };
+});
+
+/** Unset = the real config loader; set = what `runSessionStartHook` resolves for this test. */
+let rawConfig: RawConfig | undefined;
+vi.mock("./config", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./config")>();
+  return {
+    ...actual,
+    loadConfig: (...a: Parameters<typeof actual.loadConfig>) =>
+      rawConfig ? actual.resolveConfig(rawConfig) : actual.loadConfig(...a),
+  };
+});
 
 /** Default roster the mock client returns; asserted on by name below. */
 const listPagesOk = async () => ({ items: [{ id: "p1", name: "Component map" }] });
 
 describe("buildSessionStartContext", () => {
+  it("warns in the user-visible banner when the old Claude Code plugin is still active", async () => {
+    const client = { listDocumentIds: async () => new Set(["git:a"]), listPages: listPagesOk };
+    const detectLegacyPlugin = vi.fn().mockReturnValue("hindsight-memory@hindsight");
+    const out = await buildSessionStartContext({
+      cwd: "/repo/dir",
+      bankId: "bank-1",
+      cfg: resolveConfig({ autoSeed: false }),
+      client,
+      detectLegacyPlugin,
+    });
+    expect(detectLegacyPlugin).toHaveBeenCalledWith("/repo/dir");
+    expect(out.systemMessage).toContain("bank-1");
+    expect(out.systemMessage).toContain("claude plugin uninstall hindsight-memory@hindsight");
+    expect(out.additionalContext).not.toContain("hindsight-memory@hindsight");
+  });
+
+  it("no warning when the old plugin is absent", async () => {
+    const client = { listDocumentIds: async () => new Set(["git:a"]), listPages: listPagesOk };
+    const out = await buildSessionStartContext({
+      cwd: "/repo/dir",
+      bankId: "bank-1",
+      cfg: resolveConfig({ autoSeed: false }),
+      client,
+      detectLegacyPlugin: () => undefined,
+    });
+    expect(out.systemMessage).not.toContain("plugin uninstall");
+  });
+
   it("cold git repo + autoSeed on -> seeds + surveys, note in systemMessage (user-visible) + roster in additionalContext (model)", async () => {
     const client = { listDocumentIds: async () => new Set<string>(), listPages: listPagesOk };
     const startSeed = vi.fn();
-    const startSurvey = vi.fn();
+    const startSurvey = vi.fn().mockResolvedValue(true);
     const out = await buildSessionStartContext({
       cwd: "/repo/dir",
       bankId: "bank-1",
@@ -35,7 +87,7 @@ describe("buildSessionStartContext", () => {
     expect(out.systemMessage).toContain("bank-1");
     // The knowledge preamble is model context, lists live pages, and drops the old static mission.
     expect(out.additionalContext).toContain("<hindsight_knowledge>");
-    expect(out.additionalContext).toContain("- Component map (p1)");
+    expect(out.additionalContext).toContain("deliberately NOT listed here");
     expect(out.additionalContext).not.toContain("agent_knowledge_list_pages");
     // The banner must NOT be duplicated into model context. (The tool guide legitimately
     // contains a "🧠 From Hindsight memory" attribution example, so match on banner text.)
@@ -58,7 +110,7 @@ describe("buildSessionStartContext", () => {
       harness: "codex",
       hasGit: () => true,
       startSeed,
-      startSurvey: vi.fn(),
+      startSurvey: vi.fn().mockResolvedValue(true),
     });
     expect(startSeed).toHaveBeenCalledWith("/repo/dir", { limit: 300, harness: "codex" });
   });
@@ -66,7 +118,7 @@ describe("buildSessionStartContext", () => {
   it("cold git repo + codebaseSurvey:false -> starts the seed but NOT the survey", async () => {
     const client = { listDocumentIds: async () => new Set<string>(), listPages: listPagesOk };
     const startSeed = vi.fn();
-    const startSurvey = vi.fn();
+    const startSurvey = vi.fn().mockResolvedValue(true);
     const out = await buildSessionStartContext({
       cwd: "/repo/dir",
       bankId: "bank-1",
@@ -101,7 +153,7 @@ describe("buildSessionStartContext", () => {
     });
     expect(startSeed).not.toHaveBeenCalled();
     expect(called).toBe(false);
-    expect(out.additionalContext).toContain("- Component map (p1)");
+    expect(out.additionalContext).toContain("deliberately NOT listed here");
     // banner shows on EVERY session now; non-cold paths use the "remembering" wording
     expect(out.systemMessage).toContain("is tracking the decisions");
     expect(out.deferInitialReflect).toBe(false);
@@ -152,7 +204,7 @@ describe("buildSessionStartContext", () => {
 
   it("warm bank (non-empty doc set) -> deepen engine fires, but no survey/note", async () => {
     const startSeed = vi.fn();
-    const startSurvey = vi.fn();
+    const startSurvey = vi.fn().mockResolvedValue(true);
     const client = { listDocumentIds: async () => new Set(["git:abc"]), listPages: listPagesOk };
     const out = await buildSessionStartContext({
       cwd: "/repo/dir",
@@ -167,7 +219,7 @@ describe("buildSessionStartContext", () => {
     expect(startSeed).toHaveBeenCalledWith("/repo/dir", { limit: 300, harness: "claude-code" });
     // The cold-only extras stay off: no survey, no user-facing learning note.
     expect(startSurvey).not.toHaveBeenCalled();
-    expect(out.additionalContext).toContain("- Component map (p1)");
+    expect(out.additionalContext).toContain("deliberately NOT listed here");
     // banner shows on EVERY session now; non-cold paths use the "remembering" wording
     expect(out.systemMessage).toContain("is tracking the decisions");
   });
@@ -201,6 +253,60 @@ describe("buildSessionStartContext", () => {
     }
   });
 
+  describe("git note against a git-log document written at another commit", () => {
+    /** A repo with two commits, the git-log document recorded at `writtenAt`, HEAD at `head`. */
+    async function banner(writtenAt: "first" | "second", head: "first" | "second") {
+      const repo = mkdtempSync(join(tmpdir(), "hs-session-start-written-at-"));
+      try {
+        execFileSync("git", ["-C", repo, "init", "-q"]);
+        execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+        execFileSync("git", ["-C", repo, "config", "user.name", "Test User"]);
+        const sha: Record<string, string> = {};
+        for (const name of ["first", "second"]) {
+          execFileSync("git", ["-C", repo, "commit", "-q", "--allow-empty", "-m", name]);
+          sha[name] = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+            encoding: "utf8",
+          }).trim();
+        }
+        execFileSync("git", ["-C", repo, "checkout", "-q", "--detach", sha[head]]);
+        const documentTags = vi.fn(async (_id: string) => [
+          "source:git-log",
+          `gitlog-head:${sha[writtenAt]}`,
+        ]);
+        const out = await buildSessionStartContext({
+          cwd: repo,
+          bankId: "bank-1",
+          cfg: resolveConfig({ codebaseSurvey: false }),
+          client: {
+            // Only the cold check finds anything: no document carries HEAD's own tag.
+            listDocumentIds: async (tag: string) =>
+              tag === "source:git" ? new Set(["git:existing"]) : new Set<string>(),
+            documentTags,
+            listPages: listPagesOk,
+          },
+          hasGit: () => true,
+          startSeed: vi.fn(),
+        });
+        return { out, documentTags, canonical: `gitlog:${repoNameOf(repo)}` };
+      } finally {
+        rmSync(repo, { recursive: true, force: true });
+      }
+    }
+
+    it("reports git in sync from a worktree behind that commit, as the deepen engine skips it (#4661)", async () => {
+      const { out, documentTags, canonical } = await banner("second", "first");
+
+      expect(out.systemMessage).toContain("git in sync");
+      expect(documentTags).toHaveBeenCalledWith(canonical);
+    });
+
+    it("still reports catching up when HEAD has a commit the document lacks", async () => {
+      const { out } = await banner("first", "second");
+
+      expect(out.systemMessage).toContain("catching up on new commits");
+    });
+  });
+
   it("listDocumentIds throws (server unreachable) -> no seed, roster preamble only", async () => {
     const startSeed = vi.fn();
     const client = {
@@ -218,7 +324,7 @@ describe("buildSessionStartContext", () => {
       startSeed,
     });
     expect(startSeed).not.toHaveBeenCalled();
-    expect(out.additionalContext).toContain("- Component map (p1)");
+    expect(out.additionalContext).toContain("deliberately NOT listed here");
     // banner shows on EVERY session now; non-cold paths use the "remembering" wording
     expect(out.systemMessage).toContain("is tracking the decisions");
   });
@@ -269,7 +375,7 @@ describe("buildSessionStartContext", () => {
     });
     expect(startSeed).not.toHaveBeenCalled();
     expect(called).toBe(false);
-    expect(out.additionalContext).toContain("- Component map (p1)");
+    expect(out.additionalContext).toContain("deliberately NOT listed here");
     // banner shows on EVERY session now; non-cold paths use the "remembering" wording
     expect(out.systemMessage).toContain("is tracking the decisions");
   });
@@ -291,6 +397,47 @@ describe("runSessionStartHook anti-recursion guard", () => {
     // proves the guard fired first.
     await runSessionStartHook(HOOK_HARNESSES["claude-code"].sessionStart, makeClient);
     expect(makeClient).not.toHaveBeenCalled();
+  });
+});
+
+/** A host's per-repo MCP registration (TraeCode's) runs only once memory is live for the repo, and
+ *  its hint reaches the user through the session banner. */
+describe("runSessionStartHook host MCP registration", () => {
+  let repo: string;
+  const run = async (cfg: RawConfig) => {
+    rawConfig = { autoSeed: false, autoUpdate: false, ...cfg };
+    stdin = JSON.stringify({ cwd: repo, session_id: `sess-${repo.split("/").pop()}` });
+    const ensureMcpRegistration = vi.fn(() => "enable workspace MCP");
+    const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    try {
+      await runSessionStartHook(
+        { ...HOOK_HARNESSES.traecode.sessionStart, ensureMcpRegistration },
+        () => ({ listPages: listPagesOk }) as never
+      );
+      return { ensureMcpRegistration, out: write.mock.calls.map((c) => String(c[0])).join("") };
+    } finally {
+      write.mockRestore();
+    }
+  };
+
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), "hs-ss-mcp-"));
+    execFileSync("git", ["init", "-q", repo]);
+  });
+  afterEach(() => {
+    rawConfig = undefined;
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("registers for a live repo and shows the hint in the banner", async () => {
+    const { ensureMcpRegistration, out } = await run({});
+    expect(ensureMcpRegistration).toHaveBeenCalledWith(repo);
+    expect(JSON.parse(out).systemMessage).toContain("enable workspace MCP");
+  });
+
+  it("does not register for a repo that is not opted in", async () => {
+    const { ensureMcpRegistration } = await run({ optInOnly: true });
+    expect(ensureMcpRegistration).not.toHaveBeenCalled();
   });
 });
 
@@ -325,7 +472,7 @@ describe("buildSessionStartContext — periodic re-survey (bank-stored commit co
   ];
 
   it(">= threshold since the latest reachable baseline -> re-surveys + records a new baseline", async () => {
-    const startSurvey = vi.fn();
+    const startSurvey = vi.fn().mockResolvedValue(true);
     const retain = vi.fn();
     await buildSessionStartContext({
       cwd: "/repo",
@@ -358,7 +505,7 @@ describe("buildSessionStartContext — periodic re-survey (bank-stored commit co
       client: warmClient(["survey-baseline:oldsha"], retain),
       hasGit: () => true,
       startSeed: vi.fn(),
-      startSurvey: vi.fn(),
+      startSurvey: vi.fn().mockResolvedValue(true),
       headSha: () => "newsha",
       commitsSince: () => 25,
     });
@@ -374,7 +521,7 @@ describe("buildSessionStartContext — periodic re-survey (bank-stored commit co
   });
 
   it("< threshold -> no re-survey, no new baseline", async () => {
-    const startSurvey = vi.fn();
+    const startSurvey = vi.fn().mockResolvedValue(true);
     const retain = vi.fn();
     await buildSessionStartContext({
       cwd: "/repo",
@@ -392,7 +539,7 @@ describe("buildSessionStartContext — periodic re-survey (bank-stored commit co
   });
 
   it("no baseline yet (upgrade from a pre-feature bank) -> records HEAD as baseline, does NOT survey", async () => {
-    const startSurvey = vi.fn();
+    const startSurvey = vi.fn().mockResolvedValue(true);
     const retain = vi.fn();
     await buildSessionStartContext({
       cwd: "/repo",
@@ -410,7 +557,7 @@ describe("buildSessionStartContext — periodic re-survey (bank-stored commit co
   });
 
   it("all markers unreachable (rebase/gc) -> re-baselines to HEAD, does NOT survey", async () => {
-    const startSurvey = vi.fn();
+    const startSurvey = vi.fn().mockResolvedValue(true);
     const retain = vi.fn();
     await buildSessionStartContext({
       cwd: "/repo",
@@ -428,7 +575,7 @@ describe("buildSessionStartContext — periodic re-survey (bank-stored commit co
   });
 
   it("takes the MIN reachable count (newest survey), ignoring older + dead-branch markers", async () => {
-    const startSurvey = vi.fn();
+    const startSurvey = vi.fn().mockResolvedValue(true);
     const counts: Record<string, number | null> = { old1: 50, old2: 10, dead: null };
     await buildSessionStartContext({
       cwd: "/repo",
@@ -445,7 +592,7 @@ describe("buildSessionStartContext — periodic re-survey (bank-stored commit co
   });
 
   it("surveyRefreshCommits=0 disables re-survey even far past threshold", async () => {
-    const startSurvey = vi.fn();
+    const startSurvey = vi.fn().mockResolvedValue(true);
     await buildSessionStartContext({
       cwd: "/repo",
       bankId: "bank-1",
@@ -461,7 +608,7 @@ describe("buildSessionStartContext — periodic re-survey (bank-stored commit co
   });
 
   it("cold seed records the survey baseline", async () => {
-    const startSurvey = vi.fn();
+    const startSurvey = vi.fn().mockResolvedValue(true);
     const retain = vi.fn();
     await buildSessionStartContext({
       cwd: "/repo",
@@ -481,7 +628,7 @@ describe("buildSessionStartContext — periodic re-survey (bank-stored commit co
 
 describe("buildSessionStartContext — crashed-survey retry (baseline without findings)", () => {
   it("re-fires the survey when a baseline exists but NO findings docs ever arrived", async () => {
-    const startSurvey = vi.fn();
+    const startSurvey = vi.fn().mockResolvedValue(true);
     const retain = vi.fn();
     const client = {
       listDocumentIds: async (tag: string) =>
@@ -507,4 +654,34 @@ describe("buildSessionStartContext — crashed-survey retry (baseline without fi
     expect(startSurvey).toHaveBeenCalledTimes(1);
     expect(out).toBeTruthy();
   });
+});
+
+describe("survey launch admission", () => {
+  it.each([false, true])(
+    "does not advance a %s warm/cold baseline when launch is skipped or fails",
+    async (warm) => {
+      const retain = vi.fn();
+      const startSurvey = vi.fn().mockResolvedValue(false);
+      await buildSessionStartContext({
+        cwd: "/repo",
+        bankId: "bank-1",
+        cfg: resolveConfig({ surveyRefreshCommits: 20 }),
+        client: {
+          listDocumentIds: async (tag) =>
+            tag === "source:survey-baseline"
+              ? new Set(["survey-baseline:oldsha"])
+              : new Set(warm ? ["git:old"] : []),
+          listPages: listPagesOk,
+          retain,
+        },
+        hasGit: () => true,
+        startSeed: vi.fn(),
+        startSurvey,
+        headSha: () => "newsha",
+        commitsSince: () => 25,
+      });
+      expect(startSurvey).toHaveBeenCalledOnce();
+      expect(retain).not.toHaveBeenCalled();
+    }
+  );
 });

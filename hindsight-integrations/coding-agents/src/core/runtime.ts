@@ -1,14 +1,16 @@
 /**
- * Host adapter runtime for PERSISTENT-PLUGIN harnesses (opencode, Kilo, Cline). It delegates SessionStart and
+ * Host adapter runtime for PERSISTENT-PLUGIN harnesses (opencode, opencode2, Kilo, Cline, dsh, pi,
+ * Prime Agent — every host that loads us once and keeps us). It delegates SessionStart and
  * prompt behavior to the same core lifecycle as fresh-process hook harnesses; this class keeps only
  * the host-specific injection, toast, and incremental-transcript responsibilities.
  *
  * A harness adapter feeds it three normalized events and reads two values back:
- *   - seedIfCold(repoPath)          : plugin load -> cold-check auto-seed + compute the page preamble
+ *   - seedIfCold(repoPath)          : plugin load -> cold-check auto-seed (the page preamble is
+ *                                     NOT computed here; onPrompt builds it per session)
  *   - onPrompt(sessionId, prompt)   : each user turn -> recall + build this turn's injection
  *   - getInjection(sessionId)       : the system-prompt text to inject this turn (or undefined)
  *   - toolSpecs()                   : the hindsight_* knowledge/recall tools to register natively
- *   - onTranscript(sessionId, turns): full transcript -> write back every N turns (on by default)
+ *   - onTranscript(sessionId, turns, lastTurnComplete): full transcript -> write back (on by default)
  *   - onSessionIdle(sessionId)      : assistant finished -> refetch + write back the completed
  *                                     exchange (the Stop-equivalent these hosts lack)
  * No opencode/claude specifics live here — only the memory logic.
@@ -19,12 +21,15 @@ import { DAEMON_WAIT_RETAIN_MS, DAEMON_WAIT_SESSION_START_MS, ensureDaemon } fro
 import { diag } from "./diag";
 import { describeError, log, setLogLevel } from "./log";
 import type { HindsightClient } from "./hindsight";
+import { buildKnowledgePreamble } from "./knowledge-injection";
 import { buildKnowledgeTools, type ToolSpec } from "./knowledge-tools";
 import { buildPageTrigger } from "./missions";
 import { retainLiveSession, type TransportTurn } from "./chat";
 import { memoryCursorStore } from "./retain-cursor";
+import { memoryUsageCursorStore, recordUsage } from "./usage";
 import { buildRetainStamp } from "./retain-stamp";
 import { buildSessionStartContext } from "./session-start";
+import { syncCompanionSkill } from "./skill-sync";
 import { buildHookOutput } from "./hook";
 import { sessionCacheFile, writeSessionCache } from "./session-cache";
 
@@ -36,13 +41,14 @@ export class RuntimeCore {
   private readonly sessionState = new Map<string, { startTs: string; retainedTurns: number }>();
   /** Live write-back cursors. In memory, unlike the hook harnesses': this host outlives the session. */
   private readonly cursors = memoryCursorStore();
+  /** Turns already written to the usage log (core/usage.ts), per session. */
+  private readonly usageCursors = memoryUsageCursorStore();
   /** Pulls a session's CURRENT transcript from the host (set by the adapter); see onSessionIdle. */
   private fetchTranscript?: (sessionId: string) => Promise<TransportTurn[]>;
   private lastInjection = ""; // most recent turn's injection block, keyed by nothing (see getInjection)
   private deferInitialReflect = false;
   /** Host-notice channel (opencode/Kilo: client.tui.showToast via the adapter). Optional, fail-open. */
   private notify?: (title: string, message: string) => void;
-  private preamble = ""; // SessionStart-equivalent knowledge preamble, computed once at seedIfCold
 
   constructor(
     private readonly client: HindsightClient,
@@ -82,6 +88,7 @@ export class RuntimeCore {
       pageTrigger: buildPageTrigger(this.cfg),
       reflectTimeoutMs: this.cfg.reflectToolTimeoutMs,
       reflectBudget: this.cfg.reflectBudget,
+      toolGuideExtra: this.cfg.toolGuideExtra,
       stampFor: () =>
         buildRetainStamp(this.cfg, {
           directory: this.projectDir,
@@ -97,15 +104,24 @@ export class RuntimeCore {
 
   /**
    * Plugin load (SessionStart-equivalent): on a cold repo, deterministically start the background
-   * git-log seed + codebase survey, and compute the knowledge-page preamble (tool guide + roster)
-   * that onPrompt injects on the session's first turn. Reuses the exact hook-harness logic
+   * git-log seed + codebase survey. Reuses the exact hook-harness logic
    * (`buildSessionStartContext`) so opencode seeds identically. Never throws.
+   *
+   * It deliberately does NOT keep that call's knowledge preamble. This runs once per PROCESS and
+   * these hosts outlive every session, so a roster captured here is stale for every session but
+   * the first — `onPrompt` builds its own from the session's live page list (#4607).
    */
   async seedIfCold(repoPath: string | undefined): Promise<void> {
     // Anti-recursion: a headless survey session runs the agent (which loads this plugin) with
     // HINDSIGHT_DISABLE_HOOKS=1 — the tools stay registered (toolSpecs, so the survey can ingest),
     // but seeding/recall/write-back must no-op or the survey would re-seed itself (see core/survey.ts).
     if (process.env.HINDSIGHT_DISABLE_HOOKS) return;
+    // Companion skill, the same housekeeping `runSessionStartHook` does for hook harnesses — but
+    // with `install`, because a persistent-plugin host can be wired by its OWN plugin manager
+    // (`dsh plugin add …`, `cline plugin install`), a route our installer never sees, leaving the
+    // plugin loaded with its tools registered and no skill on disk at all (#4406). No-op for a host
+    // with no skills directory (opencode; opencode2 registers it in memory instead).
+    syncCompanionSkill(this.harness, { install: true });
     // Daemon mode: this is the SessionStart of a persistent-plugin host, so it owns the same
     // warm-up the hook harnesses do in `runSessionStartHook` — start it before the user has typed
     // anything, wait only briefly, and let a cold one keep coming up in the background. Without it
@@ -133,10 +149,9 @@ export class RuntimeCore {
         log.info(this.harness, plain);
         this.notify?.("Hindsight", plain.replace(/^Hindsight is /, "Is "));
       }
-      this.preamble = out.additionalContext ?? "";
       this.deferInitialReflect = out.deferInitialReflect === true;
     } catch {
-      /* seeding + preamble are best-effort — a cold-check failure never breaks the agent */
+      /* seeding is best-effort — a cold-check failure never breaks the agent */
     }
   }
 
@@ -167,10 +182,19 @@ export class RuntimeCore {
     });
 
     const blocks: string[] = [];
-    // The preamble is the SessionStart-equivalent; inject it once, on the first turn (later turns get
-    // the periodic refresh below). Empty until seedIfCold resolves — if the first prompt races ahead
-    // of plugin-load seeding, the roster refresh still delivers the tool guide on cadence.
-    if (turns === 1 && this.preamble) blocks.push(this.preamble);
+    // The SessionStart-equivalent preamble, injected once on the first turn (later turns get the
+    // periodic refresh below). Built HERE, from this session's own roster, rather than reused from
+    // plugin load: that one is a process-lifetime snapshot, so a host started before the pages
+    // existed told every later session "No knowledge pages yet" while the same turn's memory block
+    // listed pages by id (#4607).
+    if (turns === 1) {
+      blocks.push(
+        buildKnowledgePreamble(output.pages, {
+          reflectOnNewGoals: this.cfg.autoInject !== "reflect",
+          extra: this.cfg.toolGuideExtra,
+        })
+      );
+    }
     if (output.context) blocks.push(output.context);
     // OpenCode has no user-message hook channel; use its native toast instead of stderr, which
     // renders inside the TUI input line. The shared output owns when a notice exists.
@@ -208,9 +232,17 @@ export class RuntimeCore {
    * (`engine.retain.fold`), so submitting every turn costs one extraction, not one per turn, and
    * nothing is ever held somewhere it can be lost.
    */
-  async onTranscript(sessionId: string, turns: TransportTurn[]): Promise<void> {
+  async onTranscript(
+    sessionId: string,
+    turns: TransportTurn[],
+    /** Whether the agent has finished answering the last prompt. Required, not defaulted: opencode
+     *  hands this over while BUILDING a request (false), pi and Cline after the run ends (true), and
+     *  a wrong default records every turn one late and never the session's last. */
+    lastTurnComplete: boolean
+  ): Promise<void> {
     if (process.env.HINDSIGHT_DISABLE_HOOKS) return; // anti-recursion (see seedIfCold)
     if (!this.writeBackEnabled || !sessionId || !turns.length) return;
+    this.recordUsage(sessionId, turns, lastTurnComplete);
     const st = this.stateFor(sessionId);
     this.retain(sessionId, turns, st.startTs);
   }
@@ -241,12 +273,28 @@ export class RuntimeCore {
       return;
     }
     if (!turns.length) return;
+    this.recordUsage(sessionId, turns, true); // idle: the reply is in
     const st = this.stateFor(sessionId);
     // idle can fire more than once for one exchange (and again on a session with no new activity);
     // only retain when this transcript actually grew past what we last wrote.
     if (turns.length <= st.retainedTurns) return;
     st.retainedTurns = turns.length;
     this.retain(sessionId, turns, st.startTs, "idle");
+  }
+
+  private recordUsage(sessionId: string, turns: TransportTurn[], lastTurnComplete: boolean): void {
+    recordUsage({
+      harness: this.harness,
+      sessionId,
+      bankId: this.bankId,
+      turns,
+      cursors: this.usageCursors,
+      lastTurnComplete,
+      // No `reviseLastTurn` here, unlike the hook path: this runtime never records a turn before its
+      // reply exists. `onTranscript` is handed `false` while the host is still building the request,
+      // which holds the turn back, and `onSessionIdle` refetches a transcript that includes the
+      // reply before recording it.
+    });
   }
 
   private stateFor(sessionId: string): {

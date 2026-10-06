@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { TransportTurn } from "./chat";
-import { fingerprintTurns, memoryCursorStore, planRetain } from "./retain-cursor";
+import {
+  MAX_CURSOR_PATHS,
+  PENDING_MAX_AGE_MS,
+  PENDING_MAX_BYTES,
+  advancePaths,
+  fingerprintTurns,
+  memoryCursorStore,
+  planRetain,
+  type PendingAppend,
+} from "./retain-cursor";
 
 const turn = (i: number): TransportTurn => ({ role: "user", content: `turn ${i}` });
 const turns = (n: number, from = 0): TransportTurn[] =>
@@ -16,6 +25,8 @@ const cursorFor = (all: TransportTurn[], count: number) => ({
 
 const SUPPORTED = { appendSupported: true, bank: BANK };
 
+const pendingAt = (at: number): PendingAppend => ({ content: "{}", operationId: "op", at });
+
 describe("planRetain", () => {
   it("appends only the turns added since the last write", () => {
     const all = turns(5);
@@ -26,11 +37,33 @@ describe("planRetain", () => {
     expect(planRetain(turns(3), undefined, SUPPORTED)).toEqual({ mode: "replace" });
   });
 
-  it("replaces when the previous write was never confirmed", () => {
-    // The one case that would DUPLICATE turns inside the document if we appended anyway: the
-    // server may or may not hold the last slice, and only a replace settles it.
+  it("replaces when a previous REPLACE was never confirmed", () => {
+    // Nothing is buffered for a replace — another one re-establishes the same truth.
     const all = turns(5);
     expect(planRetain(all, { ...cursorFor(all, 3), dirty: true }, SUPPORTED)).toEqual({
+      mode: "replace",
+    });
+  });
+
+  it("keeps appending over an unconfirmed APPEND, whose bytes are buffered for replay", () => {
+    const all = turns(5);
+    const cursor = { ...cursorFor(all, 3), pending: [pendingAt(Date.now())] };
+    expect(planRetain(all, cursor, SUPPORTED)).toEqual({ mode: "append", fromTurn: 3 });
+  });
+
+  it("replaces once a buffered append is too old for the server to still dedupe it", () => {
+    const all = turns(5);
+    const cursor = {
+      ...cursorFor(all, 3),
+      pending: [pendingAt(Date.now() - PENDING_MAX_AGE_MS - 1)],
+    };
+    expect(planRetain(all, cursor, SUPPORTED)).toEqual({ mode: "replace" });
+  });
+
+  it("replaces once the buffer has grown past the point where a replace is cheaper", () => {
+    const all = turns(5);
+    const big = { ...pendingAt(Date.now()), content: "x".repeat(PENDING_MAX_BYTES + 1) };
+    expect(planRetain(all, { ...cursorFor(all, 3), pending: [big] }, SUPPORTED)).toEqual({
       mode: "replace",
     });
   });
@@ -63,6 +96,75 @@ describe("planRetain", () => {
     expect(planRetain(all, cursorFor(all, 3), { ...SUPPORTED, bank: "other-repo" })).toEqual({
       mode: "replace",
     });
+  });
+
+  it("appends a continuation FILE whole instead of replacing the document with it", () => {
+    // Codex writes a later segment of the same task into a new rollout under the same session id
+    // (#4493). Its turns are not a continuation of the prefix we wrote — they are the turns that
+    // come AFTER it — so a replace would drop everything the earlier file contributed.
+    const fileA = turns(4);
+    const cursor = { ...cursorFor(fileA, 4), paths: ["/rollouts/a.jsonl"] };
+    const fileB = turns(2, 100);
+    expect(planRetain(fileB, cursor, { ...SUPPORTED, path: "/rollouts/b.jsonl" })).toEqual({
+      mode: "append",
+      fromTurn: 0,
+    });
+    // Equal-or-larger continuation with a different prefix: same answer, it is still a segment.
+    expect(planRetain(turns(6, 100), cursor, { ...SUPPORTED, path: "/rollouts/b.jsonl" })).toEqual({
+      mode: "append",
+      fromTurn: 0,
+    });
+  });
+
+  it("does not re-append a continuation file that was already written", () => {
+    const fileB = turns(2, 100);
+    const cursor = { ...cursorFor(fileB, 2), paths: ["/rollouts/a.jsonl", "/rollouts/b.jsonl"] };
+    expect(planRetain(fileB, cursor, { ...SUPPORTED, path: "/rollouts/b.jsonl" })).toEqual({
+      mode: "skip",
+    });
+    // And the next turns in that same file append from where it left off, not from zero.
+    expect(planRetain(turns(4, 100), cursor, { ...SUPPORTED, path: "/rollouts/b.jsonl" })).toEqual({
+      mode: "append",
+      fromTurn: 2,
+    });
+  });
+
+  it("does not re-append an earlier file whose hook arrives after the session moved on", () => {
+    // A -> B retained, then a late Stop for A (a delayed hook, or a second process still writing the
+    // earlier rollout). Against the latest path alone every alternation reads as a brand-new segment
+    // and appends the whole file again, without bound. A is a file we already wrote, so it is not a
+    // segment: this replaces, exactly as it did before #4493.
+    const fileA = turns(4);
+    const cursor = {
+      ...cursorFor(turns(2, 100), 2),
+      paths: ["/rollouts/a.jsonl", "/rollouts/b.jsonl"],
+    };
+    expect(planRetain(fileA, cursor, { ...SUPPORTED, path: "/rollouts/a.jsonl" })).toEqual({
+      mode: "replace",
+    });
+  });
+
+  it("does not duplicate a resumed transcript that copies the earlier turns", () => {
+    // A new file that REPEATS the retained prefix is an ordinary extension, not a new segment.
+    const fileA = turns(4);
+    const cursor = { ...cursorFor(fileA, 4), paths: ["/rollouts/a.jsonl"] };
+    expect(planRetain(turns(6), cursor, { ...SUPPORTED, path: "/rollouts/b.jsonl" })).toEqual({
+      mode: "append",
+      fromTurn: 4,
+    });
+  });
+
+  it("remembers the files already written, newest last and bounded", () => {
+    expect(advancePaths(["/a"], "/b")).toEqual(["/a", "/b"]);
+    // Re-writing a file we already hold moves it to the end rather than listing it twice, since it
+    // is the one the cursor's turns/fingerprint now describe.
+    expect(advancePaths(["/a", "/b"], "/a")).toEqual(["/b", "/a"]);
+    // No file (the persistent-plugin runtime) leaves the list alone.
+    expect(advancePaths(["/a"], undefined)).toEqual(["/a"]);
+    // A session that keeps moving cannot grow the cursor file without bound.
+    const many = Array.from({ length: MAX_CURSOR_PATHS + 5 }, (_, i) => `/f${i}`);
+    const capped = many.reduce<string[] | undefined>((acc, p) => advancePaths(acc, p), undefined);
+    expect(capped).toEqual(many.slice(-MAX_CURSOR_PATHS));
   });
 
   it("skips when nothing was added since the last write", () => {

@@ -43,7 +43,7 @@ async def _insert_memory(
     store = get_memories()
     fact = SimpleNamespace(
         fact_text=text,
-        embedding=memory.embeddings.encode([text])[0],
+        embedding=(await memory.embeddings.encode([text]))[0],
         fact_type=fact_type,
         tags=[],
         context=None,
@@ -100,7 +100,7 @@ async def _insert_observation(
             record=FactRecord(
                 unit_id=str(obs_id),
                 text=text,
-                embedding=memory.embeddings.encode([text])[0],
+                embedding=(await memory.embeddings.encode([text]))[0],
                 fact_type="observation",
                 proof_count=len(source_memory_ids),
                 source_memory_ids=[str(s) for s in source_memory_ids],
@@ -159,7 +159,7 @@ async def _count_surviving(conn, bank_id: str, memory_ids: list) -> int:
 
 
 async def _ensure_bank(memory: MemoryEngine, bank_id: str, request_context: RequestContext):
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
 
 # ---------------------------------------------------------------------------
@@ -806,17 +806,31 @@ async def _insert_document_with_memories(
 ) -> list[uuid.UUID]:
     """Insert a document and attach memory units to it. Returns list of memory UUIDs.
 
-    The documents row stays SQL (it is Postgres bookkeeping for every store); the memories
-    go through the store, attached via document_id at insert time.
+    The document goes wherever the store keeps it, and the memories go through the store,
+    attached via document_id at insert time. `documents` is a store table (#4969): a store that
+    owns its bank keeps the record itself and never reads the SQL row, so seeding the row here
+    left every one of these tests updating a document the engine reports as not found.
     """
-    await conn.execute(
-        """
-        INSERT INTO documents (id, bank_id, original_text, content_hash, created_at, updated_at)
-        VALUES ($1, $2, 'some doc', 'hash123', NOW(), NOW())
-        """,
-        doc_id,
-        bank_id,
-    )
+    from hindsight_api.engine.memories import get_memories
+
+    store = get_memories()
+    if store.store_owned_for(bank_id):
+        await store.put_document(
+            bank_id=bank_id,
+            document_id=doc_id,
+            content_hash="hash123",
+            original_text="some doc",
+            chunk_texts=[],
+        )
+    else:
+        await conn.execute(
+            """
+            INSERT INTO documents (id, bank_id, original_text, content_hash, created_at, updated_at)
+            VALUES ($1, $2, 'some doc', 'hash123', NOW(), NOW())
+            """,
+            doc_id,
+            bank_id,
+        )
     mem_ids = []
     for text, fact_type in memories:
         mem_ids.append(await _insert_memory(memory, conn, bank_id, text, fact_type, document_id=doc_id))
@@ -1124,6 +1138,88 @@ class TestUpdateDocumentTagsObservationCleanup:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
+    async def test_empty_tags_clears_them(self, memory: MemoryEngine, request_context: RequestContext):
+        """``tags=[]`` is a real update: it clears the document's tags and its units'.
+
+        The array is a REPLACEMENT, never a merge, so an empty one is how a caller drops
+        every tag. Every guard on the path is written ``is not None`` rather than a
+        truthiness check precisely so the empty list survives it — this test is what stops
+        one of them regressing to ``if tags:`` and turning a clear into a silent no-op.
+        """
+        bank_id = f"test-tag-update-clear-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            doc_id = f"doc-{uuid.uuid4().hex[:8]}"
+            doc_mem_ids = await _insert_document_with_memories(
+                memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")]
+            )
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()):
+            await memory.update_document(doc_id, bank_id, tags=["a", "b"], request_context=request_context)
+
+        async with pool.acquire() as conn:
+            obs_id = await _insert_observation(memory, conn, bank_id, "Alice is outdoorsy.", doc_mem_ids)
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as mock_consolidate:
+            assert await memory.update_document(doc_id, bank_id, tags=[], request_context=request_context)
+            mock_consolidate.assert_awaited()
+
+        document = await memory.get_document(doc_id, bank_id, request_context=request_context)
+        assert list(document["tags"] or []) == [], document["tags"]
+
+        async with pool.acquire() as conn:
+            for mem_id in doc_mem_ids:
+                stored_mem = await _get_memory(conn, bank_id, mem_id)
+                assert list(stored_mem.tags or []) == [], f"Memory unit {mem_id} should have no tags left"
+            # Clearing is a tag CHANGE like any other, so it runs the same cascade.
+            assert str(obs_id) not in await _get_observation_ids(conn, bank_id)
+            for mem_id in doc_mem_ids:
+                assert await _get_consolidated_at(conn, mem_id, bank_id) is None
+
+        # And clearing tags on a document that already has none is the no-op the set
+        # comparison promises — not a second round of re-consolidation.
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as mock_consolidate:
+            assert await memory.update_document(doc_id, bank_id, tags=[], request_context=request_context)
+            mock_consolidate.assert_not_awaited()
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_patch_endpoint_accepts_empty_tags(
+        self, memory: MemoryEngine, api_client, request_context: RequestContext
+    ):
+        """PATCH ``{"tags": []}`` clears the tags; only a MISSING ``tags`` is a 422.
+
+        The route rejects "no field provided" with ``body.tags is None``. An empty list is
+        a provided value, and the documented way to drop every tag, so it must reach the
+        engine rather than trip the guard.
+        """
+        bank_id = f"test-tag-patch-empty-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            doc_id = f"doc-{uuid.uuid4().hex[:8]}"
+            await _insert_document_with_memories(memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")])
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()):
+            await memory.update_document(doc_id, bank_id, tags=["a", "b"], request_context=request_context)
+
+            resp = await api_client.patch(f"/v1/default/banks/{bank_id}/documents/{doc_id}", json={"tags": []})
+        assert resp.status_code == 200, resp.text
+
+        document = await memory.get_document(doc_id, bank_id, request_context=request_context)
+        assert list(document["tags"] or []) == [], document["tags"]
+
+        # An omitted `tags` is still the "nothing to update" 422.
+        resp = await api_client.patch(f"/v1/default/banks/{bank_id}/documents/{doc_id}", json={})
+        assert resp.status_code == 422, resp.text
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
     async def test_tag_change_stamps_memory_units_updated_at(
         self, memory: MemoryEngine, request_context: RequestContext
     ):
@@ -1228,6 +1324,39 @@ class TestConsolidationSourceMemoryFiltering:
         stored_set = {str(s) for s in stored}
         assert str(live) in stored_set
         assert str(dead) not in stored_set, "Deleted source must not appear in stored observation"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_create_observation_counts_each_live_source_once(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """proof_count is the number of distinct live sources, not a literal 1 (#4955)."""
+        from tests.consolidation_actions import create_observation as _create_observation_directly
+
+        bank_id = f"test-create-proof-count-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            a = await _insert_memory(memory, conn, bank_id, "Alice changed the timeout in app.yaml.")
+            b = await _insert_memory(memory, conn, bank_id, "Alice changed the retry count in app.yaml.")
+            c = await _insert_memory(memory, conn, bank_id, "Alice changed the log level in app.yaml.")
+        dead = uuid.uuid4()
+
+        result = await _create_observation_directly(
+            pool=backend,
+            memory_engine=memory,
+            bank_id=bank_id,
+            source_memory_ids=[a, b, a, dead, c],
+            observation_text="Alice keeps tuning app.yaml.",
+        )
+
+        assert result["action"] == "created"
+        async with acquire_with_retry(backend) as conn:
+            stored = await _get_memory(conn, bank_id, result["observation_id"])
+        assert [str(s) for s in stored.source_memory_ids] == [str(a), str(b), str(c)]
+        assert stored.proof_count == 3
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
@@ -1362,5 +1491,55 @@ class TestConsolidationSourceMemoryFiltering:
         assert row.text == original_text, "observation text unchanged after the skipped update"
         stored_sources = {str(s) for s in row.source_memory_ids}
         assert stored_sources == {str(source)}, "no dead source appended"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+class TestRetagDuringConsolidation:
+    @pytest.mark.asyncio
+    async def test_retag_while_llm_runs_discards_stale_write(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """#4831: a retag landing while consolidation's LLM call runs must not let the
+        response write an observation under the old tags, nor stamp the fact consolidated.
+        The batch is discarded and the job's next fetch redoes the fact under its new tags."""
+        from hindsight_api.engine.consolidation import consolidator as C
+
+        if get_memories().store_owned:
+            pytest.skip("updated_at re-check is SQL-store only")
+
+        bank_id = f"test-retag-race-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+        pool = await memory._get_pool()
+        doc_id = f"doc-{uuid.uuid4().hex[:8]}"
+        async with pool.acquire() as conn:
+            [mem_id] = await _insert_document_with_memories(
+                memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")]
+            )
+            # Pending, as a freshly retained fact is.
+            await get_memories().mark_consolidated(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id)], when=None
+            )
+
+        calls = 0
+
+        async def fake_llm(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                with patch.object(memory, "submit_async_consolidation", new=AsyncMock()):
+                    await memory.update_document(doc_id, bank_id, tags=["new-tag"], request_context=request_context)
+            return C._BatchLLMResult(
+                creates=[C._CreateAction(text="Alice loves hiking.", source_fact_ids=[str(mem_id)])]
+            )
+
+        with patch.object(C, "_consolidate_batch_with_llm", side_effect=fake_llm):
+            await C.run_consolidation_job(memory_engine=memory, bank_id=bank_id, request_context=request_context)
+
+        assert calls == 2, "the stale batch is discarded and the fact redone on the next fetch"
+        obs = await memory.list_memory_units(bank_id, fact_type="observation", request_context=request_context)
+        assert [o["tags"] for o in obs["items"]] == [["new-tag"]]
+        done = await memory.list_memory_units(bank_id, consolidation_state="done", request_context=request_context)
+        assert [o["id"] for o in done["items"]] == [str(mem_id)]
 
         await memory.delete_bank(bank_id, request_context=request_context)

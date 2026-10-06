@@ -10,10 +10,10 @@ avoiding Python-level wrapping overhead (~570K __getitem__ calls per
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
-import asyncpg  # noqa: F401
+import asyncpg
 
 from .base import DatabaseBackend, DatabaseConnection
 from .pool_instrumentation import PoolStats, instrument_acquire
@@ -108,10 +108,12 @@ class PostgresConnection(DatabaseConnection):
             yield self
 
     async def execute(self, query: str, *args: Any, timeout: float | None = None) -> str:
-        return await self._conn.execute(query, *args, timeout=timeout)
+        # asyncpg's stubs declare `timeout: float`; None is its documented "no timeout", and
+        # every method on this class passes it straight through.
+        return await self._conn.execute(query, *args, timeout=cast(float, timeout))
 
     async def executemany(self, query: str, args: list[tuple[Any, ...]], *, timeout: float | None = None) -> None:
-        await self._conn.executemany(query, args, timeout=timeout)
+        await self._conn.executemany(query, args, timeout=cast(float, timeout))
 
     async def fetch(self, query: str, *args: Any, timeout: float | None = None) -> list:
         # Return raw asyncpg.Record objects — they satisfy the ResultRow
@@ -176,6 +178,11 @@ def _application_name_setup(app_name: str, init_callback: Any | None) -> Callabl
     Re-asserting it on every acquire fixes both topologies. ``set_config``
     rather than ``SET`` because the name is operator-supplied and ``SET`` does
     not accept bind parameters.
+
+    The pool no longer sends that ``RESET ALL`` at all (see _NoResetConnection),
+    so on a direct connection the startup value now survives. The hook stays
+    because pgbouncer still applies its own ``SET`` when it links a client to a
+    server connection, and that is the topology this was added for.
     """
 
     async def _setup(conn: Any) -> None:
@@ -184,6 +191,33 @@ def _application_name_setup(app_name: str, init_callback: Any | None) -> Callabl
             await init_callback(conn)
 
     return _setup
+
+
+class _NoResetConnection(asyncpg.Connection):
+    """Connection whose release skips asyncpg's reset query.
+
+    asyncpg sends ``SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *;
+    RESET ALL;`` on every release. Returning an empty reset query makes
+    ``Connection.reset()`` skip it entirely (``if reset_query: await
+    self.execute(reset_query)``), saving a round trip per acquire/release cycle.
+
+    This is the only lever that works: passing ``reset=`` to ``create_pool`` does
+    NOT replace the default — asyncpg runs ``_con._reset()`` and *then* the
+    callback, so that knob only adds work.
+
+    ``_reset()`` still runs, so an open transaction is still rolled back and
+    listener callbacks are still dropped; only the SQL statement is skipped.
+
+    Two things do NOT get undone any more, and both are asserted or documented in
+    tests/test_db_pool_reset.py: session state set with a plain ``SET`` (the
+    codebase creates none — everything is ``SET LOCAL``), and a GUC the pool's own
+    session setup *stops* sending. The second is why the setup must keep deriving
+    its settings from process-static config: a connection opened while a GUC was
+    being sent keeps it until the connection is replaced.
+    """
+
+    def get_reset_query(self) -> str:
+        return ""
 
 
 class PostgreSQLBackend(DatabaseBackend):
@@ -243,8 +277,12 @@ class PostgreSQLBackend(DatabaseBackend):
         app_name = application_name_from_dsn(dsn)
         pool_init = _application_name_setup(app_name, init_callback) if app_name else init_callback
 
-        # init runs once per new connection; setup runs on every acquire, after
-        # asyncpg's release-time RESET ALL. Re-running the session GUCs
+        # init runs once per new connection; setup runs on every acquire. The
+        # release-time RESET ALL that used to wipe the GUCs between the two is
+        # gone (see _NoResetConnection), so on a direct connection this re-apply
+        # is redundant — but behind a transaction-mode pooler each acquire may
+        # land on a different server connection, so it is not.
+        # Re-running the session GUCs
         # (hnsw.ef_search, statement_timeout, …) there is what keeps a *reused*
         # connection from silently falling back to server defaults, so it is the
         # default. Deployments that pin those GUCs server-side (ALTER ROLE /
@@ -261,6 +299,11 @@ class PostgreSQLBackend(DatabaseBackend):
         else:
             pool_setup = _application_name_setup(app_name, None) if app_name else None
 
+        # Skipping asyncpg's release-time reset removes one Postgres round trip
+        # per acquire/release cycle (and, behind a transaction-mode pooler, one
+        # server-side transaction): measured as 1 of ~5 round trips on a
+        # single-lookup endpoint, in both topologies. See _NoResetConnection for
+        # the invariants that make it safe here.
         self._pool = await asyncpg.create_pool(
             dsn,
             min_size=min_size,
@@ -270,6 +313,7 @@ class PostgreSQLBackend(DatabaseBackend):
             timeout=acquire_timeout,
             init=pool_init,
             setup=pool_setup,
+            connection_class=_NoResetConnection,
         )
         logger.info(
             f"PostgreSQL pool created (min={min_size}, max={max_size}, "

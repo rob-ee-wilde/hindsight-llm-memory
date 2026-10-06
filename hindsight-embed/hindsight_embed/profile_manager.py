@@ -182,7 +182,7 @@ def unlock_file(file_obj: IO[str]) -> None:
     _release_lock(file_obj)
 
 
-import httpx
+from ._http_probe import probe_get
 
 # Configuration paths
 CONFIG_DIR = Path.home() / ".hindsight"
@@ -230,7 +230,7 @@ class ProfilePaths:
     lock: Path
     log: Path
     port: int
-    ui_log: Path = None  # type: ignore[assignment]
+    ui_log: Path = None  # ty: ignore[invalid-assignment]  -- __post_init__ derives it from `log`
     ui_port: int = 0  # 0 → derive as port + UI_PORT_OFFSET
 
     def __post_init__(self):
@@ -679,12 +679,8 @@ class ProfileManager:
         Returns:
             True if daemon is responding.
         """
-        try:
-            with httpx.Client() as client:
-                response = client.get(f"http://127.0.0.1:{port}/health", timeout=1)
-                return response.status_code == 200
-        except Exception:
-            return False
+        response = probe_get(f"http://127.0.0.1:{port}/health", read_timeout=1.0)
+        return response is not None and response.status_code == 200
 
     def _load_metadata(self) -> ProfileMetadata:
         """Load profile metadata from disk.

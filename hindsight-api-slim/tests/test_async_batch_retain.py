@@ -136,6 +136,46 @@ async def test_shared_and_distinct_document_ids_sync(memory, request_context):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("queued", [False, True], ids=["sync", "async"])
+async def test_item_without_document_id_not_absorbed(memory, request_context, queued):
+    """An item without a document_id next to ONE item that has one gets its own
+    document; it is not folded into the other item's document, whose replace
+    would otherwise delete its facts too (issue #4931). The queued and in-process
+    paths must agree."""
+    bank_id = f"test_idless_not_absorbed_{uuid.uuid4().hex}"
+    contents = [
+        {"content": "Alice works at Google", "document_id": "report-2024"},
+        {"content": "Bob loves Python"},
+    ]
+    try:
+        if queued:
+            submitted = await memory.submit_async_retain(
+                bank_id=bank_id, contents=contents, request_context=request_context
+            )
+            # SyncTaskBackend runs the children on submit.
+            await asyncio.sleep(0.1)
+            status = await memory.get_operation_status(
+                bank_id=bank_id, operation_id=submitted["operation_id"], request_context=request_context
+            )
+            assert status["status"] == "completed"
+        else:
+            result = await memory.retain_batch_async(
+                bank_id=bank_id, contents=contents, request_context=request_context
+            )
+            assert len(result) == 2
+            assert result[1]
+
+        docs = await memory.list_documents(bank_id=bank_id, request_context=request_context)
+        assert docs["total"] == 2
+
+        report = await memory.get_document("report-2024", bank_id, request_context=request_context)
+        assert "Alice works at Google" in report["original_text"]
+        assert "Bob loves Python" not in report["original_text"]
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
 async def test_shared_document_id_folds_sync_large_batch(memory, request_context):
     """A shared-document batch large enough to exceed the auto-split token
     threshold still folds into one document with NO lost content. Splitting one
@@ -1706,3 +1746,77 @@ async def test_multi_document_batch_does_not_misattribute_document_id(memory, re
     # parent nor the child resolves to a single document_id.
     assert ops, "expected operations for the batch"
     assert all(op["document_id"] is None for op in ops)
+
+
+# --- NUL / lone surrogate in a queued item (PR #3908) ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_async_retain_survives_nul_and_surrogate_in_any_field(memory, request_context, monkeypatch):
+    """A queued item carrying U+0000 must be stored, not 500 on the jsonb INSERT.
+
+    ``submit_async_retain`` serializes the whole item into
+    ``async_operations.task_payload::jsonb``. PostgreSQL stores U+0000 in neither
+    ``text`` nor ``jsonb`` and asyncpg cannot UTF-8-encode a lone surrogate, so
+    before the ingress scrub one such character *anywhere* in the item — content,
+    a tag, a nested metadata value, even a metadata key — aborted that INSERT with
+    ``UntranslatableCharacterError``. The request returned 500 and the memory was
+    never queued; the failure is deterministic for that payload, so a retrying
+    client re-sent it forever.
+    """
+    nul = "\u0000"
+    surrogate = "\ud83d"
+
+    bank_id = f"test_nul_payload_{uuid.uuid4().hex[:8]}"
+    pool = await memory._get_pool()
+    await _ensure_bank(pool, bank_id)
+
+    # Structural assertion on the committed rows — no need to drive the pipeline.
+    async def noop_submit_task(_task_dict):
+        return None
+
+    monkeypatch.setattr(memory._task_backend, "submit_task", noop_submit_task)
+
+    document_id = f"doc-{uuid.uuid4().hex[:8]}"
+    result = await memory.submit_async_retain(
+        bank_id=bank_id,
+        contents=[
+            {
+                "content": f"Alice{nul} joined the {surrogate}team.",
+                "context": f"team{nul} meeting",
+                "document_id": f"{document_id}{nul}",
+                "metadata": {f"so{nul}urce": f"sl{nul}ack", "nested": [f"a{nul}b"]},
+                "tags": [f"te{nul}am"],
+            }
+        ],
+        document_tags=[f"batch{nul}"],
+        request_context=request_context,
+    )
+
+    assert result["operation_id"]
+
+    # Read the committed row directly: the assertion is about what reached the
+    # jsonb column, which no engine read method exposes (the surrounding tests in
+    # this file inspect task_payload the same way).
+    children = await pool.fetch(
+        """
+        SELECT task_payload
+        FROM async_operations
+        WHERE bank_id = $1 AND operation_type = 'retain'
+        """,
+        bank_id,
+    )
+    assert len(children) == 1
+    payload = children[0]["task_payload"]
+    payload = json.loads(payload) if isinstance(payload, str) else payload
+
+    item = payload["contents"][0]
+    assert item["content"] == "Alice joined the team."
+    assert item["context"] == "team meeting"
+    assert item["document_id"] == document_id
+    assert item["metadata"] == {"source": "slack", "nested": ["ab"]}
+    assert item["tags"] == ["team"]
+    assert payload["document_tags"] == ["batch"]
+    # Nothing hostile may remain anywhere in the round-tripped payload.
+    assert nul not in json.dumps(payload)
+    assert surrogate not in json.dumps(payload)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
@@ -104,7 +103,7 @@ def ann_max_scan_tuples() -> int:
 #
 # - pgvector exposes hnsw.ef_search. The 60 / 200 pair is unchanged from the
 #   pre-dispatcher code (internal benchmarks tuned around our embedding count
-#   and recall floor; see the link_utils / pool init call sites for the
+#   and recall floor; see the memories/pg/links / pool init call sites for the
 #   latency-vs-recall framing). With iterative scans on (below) the ef value is a
 #   batch size rather than a ceiling, so a query's own LIMIT decides its depth.
 # - vchord exposes vchordrq.probes, but its shape must match the index's
@@ -163,13 +162,17 @@ _INSTALL_HINTS = {
 def configured_vector_extension() -> str:
     """Return the user-configured vector backend extension.
 
-    Reads ``HINDSIGHT_API_VECTOR_EXTENSION`` (default ``"pgvector"``) and
-    validates it via :func:`validate_extension`. This is the single source of
-    truth for runtime code that needs to dispatch behaviour by vector backend;
-    callers should prefer this over reading the env var directly, so the
-    default value and the lookup mechanism live in one place.
+    Reads ``vector_extension`` off the resolved config, which is where
+    ``HINDSIGHT_API_VECTOR_EXTENSION`` and its default are parsed. This is the single
+    source of truth for runtime code that needs to dispatch behaviour by vector
+    backend; callers should prefer this over reading the env var directly.
+
+    The config import is deferred because ``config.py`` imports this module for
+    :func:`validate_extension` — at module scope the two would form a cycle.
     """
-    return validate_extension(os.getenv("HINDSIGHT_API_VECTOR_EXTENSION", "pgvector"))
+    from .config import get_config
+
+    return validate_extension(get_config().vector_extension)
 
 
 def validate_extension(name: str) -> str:
@@ -336,7 +339,11 @@ def per_bank_index_min_submit_interval_seconds() -> int:
 
 
 def bootstrap_extension(conn: Connection, ext: str) -> None:
-    """Install the configured vector extension and any prerequisites if possible."""
+    """Install the configured vector extension and any prerequisites if possible.
+
+    ``create_extension`` skips anything already installed, so this issues no
+    DDL on a database that is already set up.
+    """
     normalized = validate_extension(ext)
     for name, cascade in _EXTENSION_INSTALL_PLAN[normalized]:
         create_extension(conn, name, cascade=cascade)

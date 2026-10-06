@@ -49,13 +49,19 @@ describe("resolveHarnessLogo", () => {
     "cursor-cli",
     "devin-cli",
     "dsh",
+    "factory-droid",
     "grok-build",
     "kilo",
+    "kimi-code",
     "opencode",
     "opencode2",
     "pi",
     "prime-agent",
     "qwen-code",
+    "zcode",
+    "traecode",
+    "workbuddy",
+    "codebuddy",
   ];
   // Ids the integration used to emit. Kept so documents already retained under
   // them keep their logo; a new id never belongs here.

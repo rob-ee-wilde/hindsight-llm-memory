@@ -7,6 +7,7 @@
 import { runHook, type HookSpec } from "../core/hook";
 import { runRetainHook, type RetainHookSpec } from "../core/retain-hook";
 import { runSessionStartHook, type SessionStartHookSpec } from "../core/session-start";
+import { ensureTraecodeWorkspaceMcp } from "../core/traecode-mcp";
 import { readCodexTranscript } from "../core/transcript-codex";
 import { readCursorTranscript } from "../core/transcript-cursor";
 import { readAntigravityTranscript } from "../core/transcript-antigravity";
@@ -15,6 +16,11 @@ import { grokTranscriptPath, readGrokTranscript } from "../core/transcript-grok"
 import { readDevinTranscript } from "../core/transcript-devin";
 import { dcodeAssistantText, readDcodeTranscript } from "../core/transcript-dcode";
 import { readQwenTranscript } from "../core/transcript-qwen";
+import { readDroidTranscript } from "../core/transcript-droid";
+import { zcodeAssistantText } from "../core/transcript-zcode";
+import { kimiPromptText, kimiSessionDir, readKimiTranscript } from "../core/transcript-kimi";
+import { readWorkbuddyTranscript } from "../core/transcript-workbuddy";
+import { readCodebuddyTranscript } from "../core/transcript-codebuddy-ide";
 
 export type HookHarnessName =
   | "claude-code"
@@ -25,9 +31,27 @@ export type HookHarnessName =
   | "devin-cli"
   | "grok-build"
   | "dcode"
-  | "qwen-code";
+  | "qwen-code"
+  | "factory-droid"
+  | "zcode"
+  | "traecode"
+  | "kimi-code"
+  | "workbuddy"
+  | "codebuddy";
 export type HookLifecycle = "sessionStart" | "prompt" | "stop";
-export type HookConfigStyle = "nested" | "flat";
+/**
+ * How the HOST spells one hook registration.
+ *   nested  — Claude Code's matcher group: `[{hooks:[{type:"command", command, timeout}]}]`.
+ *   flat    — one `{command, timeout}` object per entry (Cursor, Copilot, Antigravity).
+ *   process — ZCode's: a matcher group like `nested`, but the command is SPLIT into an argv
+ *             (`type:"process"`, `command:"node"`, `args:[...]`) and the budget is `timeoutMs`.
+ *             The split matters: ZCode spawns without a shell, so a quoted command string is
+ *             looked up verbatim as an executable name and never runs.
+ *   toml-array — Kimi Code's flat `[[hooks]]` array of tables, whose entry schema is strict
+ *             (event/matcher/command/timeout); a fifth key drops EVERY hook in the file, so
+ *             its installer writes the block itself. See the installer's kimi adapter.
+ */
+export type HookConfigStyle = "nested" | "flat" | "process" | "toml-array";
 
 export interface HookInstallSpec {
   event: string;
@@ -50,6 +74,8 @@ export interface HookHarnessSpec {
   /** Defaults to "seconds" when absent — the unit every host but qwen-code uses. */
   timeoutUnit?: HookTimeoutUnit;
   install: Record<HookLifecycle, HookInstallSpec>;
+  /** Native host events beyond the shared three-stage lifecycle. */
+  additionalHooks?: HookInstallSpec[];
   sessionStart: SessionStartHookSpec;
   prompt: HookSpec;
   retain: RetainHookSpec;
@@ -89,6 +115,18 @@ const dcodePrompt: HookSpec = {
 };
 
 /**
+ * Factory Droid speaks Claude Code's hook protocol field for field: `session_id`, `transcript_path`
+ * and `cwd` in, `hookSpecificOutput.additionalContext` + `systemMessage` out. Its user-level hook
+ * config (`~/.factory/hooks.json`) also uses Claude's matcher-group shape, so the only real
+ * difference from `claude-code` is where the installer writes the registration and which transcript
+ * reader parses the file.
+ */
+const droidPrompt: HookSpec = {
+  ...claudePrompt,
+  harness: "factory-droid",
+};
+
+/**
  * Qwen Code speaks Claude Code's hook protocol field for field (session_id / transcript_path / cwd
  * in, hookSpecificOutput.additionalContext + systemMessage out), so only `parse` differs — and it
  * reads `submitted_prompt`, NOT `prompt`.
@@ -114,6 +152,10 @@ const qwenPrompt: HookSpec = {
     sessionId: ev.session_id as string | undefined,
   }),
 };
+
+/** ZCode sends `session_id` on UserPromptSubmit and BOTH spellings on Stop; accept either. */
+const zcodeSessionId = (ev: Record<string, unknown>): string | undefined =>
+  (ev.session_id as string | undefined) ?? (ev.sessionId as string | undefined);
 
 const antigravityCwd = (ev: Record<string, unknown>): string | undefined =>
   Array.isArray(ev.workspacePaths) ? (ev.workspacePaths[0] as string | undefined) : undefined;
@@ -158,7 +200,10 @@ const copilotPrompt: HookSpec = {
   }),
 };
 
-const devinCwd = (): string | undefined => process.env.DEVIN_PROJECT_DIR;
+// Devin does not set DEVIN_PROJECT_DIR in every spawn context. It still launches hooks from the
+// project dir, so fall back to the process cwd; env-only resolution tagged those sessions
+// `project:unknown` (#4756).
+const devinCwd = (): string => process.env.DEVIN_PROJECT_DIR || process.cwd();
 const devinPrompt: HookSpec = {
   harness: "devin-cli",
   requireCwd: true,
@@ -187,6 +232,58 @@ const standardSessionStart = (harness: string): SessionStartHookSpec => ({
   }),
 });
 
+/**
+ * WorkBuddy and CodeBuddy share the `@genie/agent-cli` engine, which differs from Claude Code in two
+ * ways that matter here (both read from its bundle):
+ *   - when a hook's output carries no `hookSpecificOutput.additionalContext`, the engine pastes the
+ *     hook's RAW stdout into the model's context — our JSON, ANSI-coloured banner and all.
+ *     `suppressOutput` turns that fallback off; `additionalContext` still reaches the model and
+ *     `systemMessage` is still shown to the user.
+ *   - its SessionStart payload has no `cwd`; the engine sets CODEBUDDY_PROJECT_DIR on every hook.
+ */
+const genieSessionStart = (harness: string): SessionStartHookSpec => {
+  const base = standardSessionStart(harness);
+  return {
+    ...base,
+    parse: (ev) => ({
+      cwd: (ev.cwd as string | undefined) || process.env.CODEBUDDY_PROJECT_DIR,
+      sessionId: ev.session_id as string | undefined,
+    }),
+    emit: (out) => ({ ...(base.emit(out) as object), suppressOutput: true }),
+  };
+};
+
+const geniePrompt = (harness: string): HookSpec => ({
+  ...claudePrompt,
+  harness,
+  emit: (context, notice, ev) => ({
+    ...(claudePrompt.emit(context, notice, ev) as object),
+    suppressOutput: true,
+  }),
+});
+
+const genieRetain = (
+  harness: string,
+  readTranscript: RetainHookSpec["readTranscript"]
+): RetainHookSpec => ({
+  hostTimeoutSec: 60,
+  harness,
+  parse: (ev) => ({
+    sessionId: ev.session_id as string | undefined,
+    transcriptPath: ev.transcript_path as string | undefined,
+    cwd: ev.cwd as string | undefined,
+  }),
+  readTranscript,
+});
+
+/**
+ * Grok Build also runs the hooks in ~/.claude/settings.json (its Claude compatibility layer), so
+ * without this gate every Grok session would run Claude Code's hooks next to Grok's own: a second
+ * SessionStart injection, a second recall per prompt, and a retain tagged claude-code. Grok's hook
+ * runner sets the reserved GROK_HOOK_EVENT on every hook process; Claude Code never does.
+ */
+const notGrokHosted = (): boolean => !process.env.GROK_HOOK_EVENT;
+
 export const HOOK_HARNESSES: Record<HookHarnessName, HookHarnessSpec> = {
   "claude-code": {
     configStyle: "nested",
@@ -195,11 +292,12 @@ export const HOOK_HARNESSES: Record<HookHarnessName, HookHarnessSpec> = {
       prompt: { event: "UserPromptSubmit", entry: "claude-hook.js", timeout: 30 },
       stop: { event: "Stop", entry: "claude-stop-hook.js", timeout: 60 },
     },
-    sessionStart: standardSessionStart("claude-code"),
-    prompt: claudePrompt,
+    sessionStart: { ...standardSessionStart("claude-code"), accept: notGrokHosted },
+    prompt: { ...claudePrompt, accept: notGrokHosted },
     retain: {
       hostTimeoutSec: 60,
       harness: "claude-code",
+      accept: notGrokHosted,
       parse: (ev) => ({
         sessionId: ev.session_id as string | undefined,
         transcriptPath: ev.transcript_path as string | undefined,
@@ -425,7 +523,7 @@ export const HOOK_HARNESSES: Record<HookHarnessName, HookHarnessSpec> = {
     // `detached` and terminates the whole process TREE on timeout, so the retain is genuinely lost
     // rather than merely orphaned. `retain.hostTimeoutSec` below stays SECONDS, as its name says;
     // these two numbers are the same budget in different units for this harness alone.
-    // The prompt timeout must also stay above core/hook.ts's HOOK_REFLECT_CAP_MS (25_000).
+    // The prompt timeout must also stay above core/config.ts's DEFAULT_REFLECT_TIMEOUT_MS.
     install: {
       sessionStart: { event: "SessionStart", entry: "qwen-sessionstart-hook.js", timeout: 30_000 },
       prompt: { event: "UserPromptSubmit", entry: "qwen-hook.js", timeout: 30_000 },
@@ -445,6 +543,242 @@ export const HOOK_HARNESSES: Record<HookHarnessName, HookHarnessSpec> = {
       }),
       readTranscript: readQwenTranscript,
     },
+  },
+  "factory-droid": {
+    configStyle: "nested",
+    install: {
+      sessionStart: { event: "SessionStart", entry: "droid-sessionstart-hook.js", timeout: 30 },
+      prompt: { event: "UserPromptSubmit", entry: "droid-hook.js", timeout: 30 },
+      stop: { event: "Stop", entry: "droid-stop-hook.js", timeout: 60 },
+    },
+    // Droid emits Notification(idle_prompt), not Stop, after user cancellation. Reusing the
+    // idempotent retain entry point captures that final partial turn; its event gate ignores every
+    // other notification type before config or daemon work begins.
+    additionalHooks: [{ event: "Notification", entry: "droid-stop-hook.js", timeout: 60 }],
+    sessionStart: standardSessionStart("factory-droid"),
+    prompt: droidPrompt,
+    retain: {
+      hostTimeoutSec: 60,
+      harness: "factory-droid",
+      accept: (ev) =>
+        ev.hook_event_name === "Stop" ||
+        (ev.hook_event_name === "Notification" && ev.notification_type === "idle_prompt"),
+      parse: (ev) => ({
+        sessionId: ev.session_id as string | undefined,
+        transcriptPath: ev.transcript_path as string | undefined,
+        cwd: ev.cwd as string | undefined,
+      }),
+      readTranscript: readDroidTranscript,
+    },
+  },
+  /**
+   * ZCode (Z.ai's GLM coding agent) embeds the Claude Code agent runtime, so its hook PROTOCOL is
+   * Claude's — `prompt`/`cwd` in, `hookSpecificOutput.additionalContext` + `systemMessage` out —
+   * with `sessionId` accepted alongside `session_id`, which its Stop payload sends instead.
+   *
+   * What is not Claude's is the TRANSCRIPT, and that is the whole of the difference here. ZCode
+   * keeps no durable session file: `Stop` carries the reply in `responseText` plus a temp,
+   * assistant-only transcript it deletes as soon as the hook returns, and no user prompt at all.
+   * So this is the one harness that retains from the plugin's own journal (core/turn-journal.ts) —
+   * the prompt hook appends the user turn, `journal.assistantText` closes it with the reply — and
+   * everything downstream (cursor, append, stamping) sees the same full conversation as any host
+   * transcript.
+   */
+  zcode: {
+    configStyle: "process",
+    // ZCode's `timeoutMs`, so MILLISECONDS — see the qwen-code note above for the same trap. The
+    // prompt budget must stay above core/config.ts's DEFAULT_REFLECT_TIMEOUT_MS.
+    timeoutUnit: "milliseconds",
+    install: {
+      sessionStart: { event: "SessionStart", entry: "zcode-sessionstart-hook.js", timeout: 30_000 },
+      prompt: { event: "UserPromptSubmit", entry: "zcode-hook.js", timeout: 30_000 },
+      stop: { event: "Stop", entry: "zcode-stop-hook.js", timeout: 60_000 },
+    },
+    sessionStart: {
+      ...standardSessionStart("zcode"),
+      parse: (ev) => ({ cwd: ev.cwd as string | undefined, sessionId: zcodeSessionId(ev) }),
+    },
+    prompt: {
+      ...claudePrompt,
+      harness: "zcode",
+      journalPrompt: true,
+      parse: (ev) => ({
+        prompt: (ev.prompt as string | undefined) ?? (ev.user_prompt as string | undefined),
+        cwd: ev.cwd as string | undefined,
+        sessionId: zcodeSessionId(ev),
+      }),
+    },
+    retain: {
+      hostTimeoutSec: 60,
+      harness: "zcode",
+      // No transcriptPath: the journal supplies it (see `journal` below).
+      parse: (ev) => ({ sessionId: zcodeSessionId(ev), cwd: ev.cwd as string | undefined }),
+      journal: {
+        // `responseText` is the full reply and is what ZCode sends in practice. The ephemeral
+        // transcript is the fallback when it is absent, and `responsePreview` — which is
+        // TRUNCATED — is the last resort, preferred only over losing the turn entirely.
+        assistantText: (ev) =>
+          (
+            (ev.responseText as string | undefined) ||
+            zcodeAssistantText(ev.transcript_path as string | undefined) ||
+            (ev.responsePreview as string | undefined) ||
+            ""
+          ).trim(),
+      },
+    },
+  },
+  /**
+   * TraeCode (TRAE CN's agent) also speaks Claude Code's hook protocol — `prompt`/`cwd`/`session_id`
+   * in, `hookSpecificOutput.additionalContext` + `systemMessage` out — with registrations nested
+   * under the top-level `hooks` key of `~/.trae-cn/hooks.json` (unlike Factory Droid, whose event
+   * map IS the file) and a `version` field the host writes and expects.
+   *
+   * Like ZCode, what it does not have is a TRANSCRIPT: sessions live in an encrypted local DB or
+   * the cloud and no `transcript_path` is ever supplied, so this is the second harness that retains
+   * from the plugin's own journal (core/turn-journal.ts) — the prompt hook appends the user turn,
+   * and Stop's `last_assistant_message` (the full reply) plays the role ZCode's `responseText`
+   * plays: `journal.assistantText` closes the turn with it.
+   */
+  traecode: {
+    configStyle: "nested",
+    install: {
+      sessionStart: { event: "SessionStart", entry: "traecode-sessionstart-hook.js", timeout: 30 },
+      prompt: { event: "UserPromptSubmit", entry: "traecode-hook.js", timeout: 30 },
+      stop: { event: "Stop", entry: "traecode-stop-hook.js", timeout: 60 },
+    },
+    sessionStart: {
+      ...standardSessionStart("traecode"),
+      // Trae launches USER-level MCP servers from the Electron process's cwd (home), where an
+      // optInOnly config self-disables and the tools vanish. Each repo's own workspace file fixes
+      // it — kept current here, once memory is confirmed live for the repo, along with the
+      // workspace's per-server enable switch (seeded into Trae's storage DB,
+      // core/traecode-mcp.ts). The returned hint (global gate off, or an unseedable switch)
+      // rides the session banner.
+      ensureMcpRegistration: (cwd) => ensureTraecodeWorkspaceMcp(cwd),
+    },
+    prompt: {
+      ...claudePrompt,
+      harness: "traecode",
+      journalPrompt: true,
+      // TraeCode's UserPromptSubmit payload carries `prompt` exactly like Claude Code's.
+      parse: (ev) => ({
+        prompt: ev.prompt as string | undefined,
+        cwd: ev.cwd as string | undefined,
+        sessionId: ev.session_id as string | undefined,
+      }),
+    },
+    retain: {
+      hostTimeoutSec: 60,
+      harness: "traecode",
+      // No transcriptPath: the journal supplies it (see `journal` below).
+      parse: (ev) => ({
+        sessionId: ev.session_id as string | undefined,
+        cwd: ev.cwd as string | undefined,
+      }),
+      journal: {
+        // `last_assistant_message` is the full reply — TraeCode's `responseText`.
+        assistantText: (ev) => ((ev.last_assistant_message as string | undefined) ?? "").trim(),
+      },
+    },
+  },
+  "kimi-code": {
+    // Kimi's ~/.kimi-code/config.toml takes a FLAT [[hooks]] array whose entries are validated by a
+    // strict 4-key schema (event/matcher/command/timeout). Neither JSON style can express it, and a
+    // fifth key drops EVERY hook in the file at warning severity, so its installer writes the block
+    // itself (the grok-build pattern) rather than going through mergeHarnessHooks.
+    configStyle: "toml-array",
+    install: {
+      // Timeouts are SECONDS here (integer 1-600, default 30) — the same unit as every other
+      // supported host, and the opposite of qwen-code's identically named field.
+      sessionStart: { event: "SessionStart", entry: "kimi-sessionstart-hook.js", timeout: 30 },
+      prompt: { event: "UserPromptSubmit", entry: "kimi-hook.js", timeout: 30 },
+      stop: { event: "Stop", entry: "kimi-stop-hook.js", timeout: 60 },
+    },
+    sessionStart: {
+      harness: "kimi-code",
+      parse: (ev) => ({
+        cwd: ev.cwd as string | undefined,
+        sessionId: ev.session_id as string | undefined,
+      }),
+      // Kimi runs SessionStart hooks for their side effects only: it awaits the trigger and drops
+      // the result, so nothing emitted here can reach the model or the terminal. Installed for the
+      // seed/daemon/session-root work runSessionStartHook does, and silent like antigravity-cli's.
+      emit: () => ({}),
+    },
+    prompt: {
+      harness: "kimi-code",
+      parse: (ev) => ({
+        // A block array, not a string — the same shape as the wire log's `turn.prompt.input`.
+        prompt: kimiPromptText(ev.prompt),
+        cwd: ev.cwd as string | undefined,
+        sessionId: ev.session_id as string | undefined,
+      }),
+      // Kimi has no additionalContext: a top-level `message` is the injection channel, which the
+      // CLI wraps as <hook_result hook_event="UserPromptSubmit"> and appends to the conversation.
+      // `notice` has no banner channel to reach (the copilot-cli precedent), but it cannot simply
+      // be dropped: when a hook's stdout parses to JSON carrying no message, Kimi falls back to
+      // injecting the RAW STDOUT, so an empty `{}` would put a literal "{}" in front of the model.
+      // Emitting the notice on the notice-only turn is what keeps that from ever happening.
+      emit: (context, notice) => ({ message: context || notice }),
+    },
+    retain: {
+      hostTimeoutSec: 60,
+      harness: "kimi-code",
+      parse: (ev) => {
+        const sessionId = ev.session_id as string | undefined;
+        return {
+          sessionId,
+          // Kimi's Stop payload carries no transcript path — its hook feature has no such field at
+          // all — so resolve the session's own directory from the id, as grok-build does. The
+          // reader takes that DIRECTORY and reads every agent's wire.jsonl beneath it.
+          transcriptPath: sessionId ? kimiSessionDir(sessionId) : undefined,
+          cwd: ev.cwd as string | undefined,
+        };
+      },
+      readTranscript: readKimiTranscript,
+    },
+  },
+  /**
+   * WorkBuddy (Tencent's AI workbench) keeps a durable transcript at
+   * ~/.workbuddy/projects/<cwd-encoded>/<uuid>.jsonl and speaks Claude's hook protocol —
+   * `session_id` / `transcript_path` / `cwd` in, hookSpecificOutput + systemMessage out — apart
+   * from the two quirks genieSessionStart/geniePrompt handle. The other host-specific piece is the
+   * transcript SCHEMA: `type:"message"` records carrying top-level `role`/`content`, which
+   * core/transcript-workbuddy.ts normalizes. Its Stop payload fills `transcript_path` for real (the
+   * engine's own getHookTranscriptPath), so it retains through `readTranscript` like every other
+   * file-backed host rather than the journal ZCode needs.
+   * CodeBuddy Code ships the same @genie/agent-cli engine and reuses this reader (see `codebuddy`).
+   */
+  workbuddy: {
+    configStyle: "nested",
+    install: {
+      sessionStart: { event: "SessionStart", entry: "workbuddy-sessionstart-hook.js", timeout: 30 },
+      prompt: { event: "UserPromptSubmit", entry: "workbuddy-hook.js", timeout: 30 },
+      stop: { event: "Stop", entry: "workbuddy-stop-hook.js", timeout: 60 },
+    },
+    sessionStart: genieSessionStart("workbuddy"),
+    prompt: geniePrompt("workbuddy"),
+    retain: genieRetain("workbuddy", readWorkbuddyTranscript),
+  },
+  /**
+   * CodeBuddy — the same `@genie/agent-cli` engine WorkBuddy ships, running under its own product
+   * config (`~/.codebuddy`; WorkBuddy only renames the home folder). Hook names and payload shape
+   * are identical, so this spec differs from `workbuddy` in the files the installer writes, the
+   * harness name stamped on what it retains — and ONE thing more: CodeBuddy ships in two hosts whose
+   * transcripts do NOT look alike. CodeBuddy Code (the CLI) writes the WorkBuddy JSONL, while the
+   * IDE hands the Stop hook its own `<conversation>/index.json` directory layout. So the reader is
+   * a dispatcher on the shape it was handed (core/transcript-codebuddy-ide.ts).
+   */
+  codebuddy: {
+    configStyle: "nested",
+    install: {
+      sessionStart: { event: "SessionStart", entry: "codebuddy-sessionstart-hook.js", timeout: 30 },
+      prompt: { event: "UserPromptSubmit", entry: "codebuddy-hook.js", timeout: 30 },
+      stop: { event: "Stop", entry: "codebuddy-stop-hook.js", timeout: 60 },
+    },
+    sessionStart: genieSessionStart("codebuddy"),
+    prompt: geniePrompt("codebuddy"),
+    retain: genieRetain("codebuddy", readCodebuddyTranscript),
   },
 };
 

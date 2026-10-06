@@ -34,16 +34,16 @@ possible future optimization.
 import asyncio
 import json
 import logging
-import os
 import time
 from contextlib import AbstractAsyncContextManager, nullcontext
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 
-from hindsight_api.config import DEFAULT_LLM_TIMEOUT, ENV_LLM_TIMEOUT
+from hindsight_api.config import get_config
 from hindsight_api.engine.bank_attribution import apply_bank_attribution
+from hindsight_api.engine.cache_affinity import apply_opencode_session, is_opencode_host
 from hindsight_api.engine.llm_interface import (
     LLM_TOOL_CHOICE_AUTO,
     LLMInterface,
@@ -52,8 +52,9 @@ from hindsight_api.engine.llm_interface import (
     OutputTooLongError,
 )
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
-from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_transport_error
+from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_llm_error
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
+from hindsight_api.engine.providers.openai_compatible_headers import with_openai_compatible_user_agent
 
 # Provider-agnostic pure helpers (text cleanup, quota-defer parsing, json-mode
 # hint). These are module-level utilities, not chat/completions behavior.
@@ -211,13 +212,15 @@ class OpenAIResponsesLLM(LLMInterface):
         self.openai_service_tier = kwargs.get("openai_service_tier")
         self._config_extra_body = extra_body or {}
         self.default_headers = default_headers
-        self.timeout = timeout or float(os.getenv(ENV_LLM_TIMEOUT, str(DEFAULT_LLM_TIMEOUT)))
+        self.timeout = timeout or get_config().llm_timeout
 
         # Manual retries (max_retries=0). Extract query params from base_url so an
         # Azure-style ``?api-version=`` is forwarded as a default query param.
-        client_kwargs: dict[str, Any] = {"api_key": self.api_key, "max_retries": 0}
-        if self.default_headers:
-            client_kwargs["default_headers"] = self.default_headers
+        client_kwargs: dict[str, Any] = {
+            "api_key": self.api_key,
+            "max_retries": 0,
+            "default_headers": with_openai_compatible_user_agent(self.default_headers),
+        }
         if self.base_url:
             parsed = urlparse(self.base_url)
             if parsed.query:
@@ -238,9 +241,9 @@ class OpenAIResponsesLLM(LLMInterface):
         )
 
     def _supports_reasoning_model(self) -> bool:
-        """Whether the model is an OpenAI reasoning model (gpt-5.x, o1, o3)."""
+        """Whether the model is an OpenAI reasoning model (gpt-5.x, gpt-6, o1, o3)."""
         model_lower = self.model.lower()
-        return any(x in model_lower for x in ["gpt-5", "o1", "o3"])
+        return any(x in model_lower for x in ["gpt-5", "gpt-6", "o1", "o3"])
 
     def supports_vision(self) -> bool:
         """OpenAI's own Responses API — every model it serves reads images."""
@@ -338,6 +341,7 @@ class OpenAIResponsesLLM(LLMInterface):
             finish_reason=finish_reason,
             error=None,
             cached_tokens=usage.cached_tokens,
+            thoughts_tokens=usage.thoughts_tokens,
             tool_calls=tool_calls_dict,
         )
 
@@ -365,13 +369,17 @@ class OpenAIResponsesLLM(LLMInterface):
             try:
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
-                    response = await self._client.responses.create(**params)
+                    # Wall-clock cap: the SDK's timeout is per phase and its read timeout restarts
+                    # on every byte, so an upstream trickling keep-alive whitespace never trips it
+                    # and the call pins its worker slot forever (#4763).
+                    response = await asyncio.wait_for(self._client.responses.create(**params), timeout=self.timeout)
                 usage = self._extract_usage(response)
                 stash_response_usage(
                     LLMResponseUsage(
                         input_tokens=usage.input_tokens,
                         output_tokens=usage.output_tokens,
                         cached_tokens=usage.cached_tokens,
+                        thoughts_tokens=usage.thoughts_tokens,
                     )
                 )
                 return parse(response)
@@ -388,14 +396,14 @@ class OpenAIResponsesLLM(LLMInterface):
                     continue
                 raise
 
-            except APIConnectionError as e:
+            except (APIConnectionError, TimeoutError) as e:
                 last_exception = e
                 status_code = getattr(e, "status_code", None) or getattr(
                     getattr(e, "response", None), "status_code", None
                 )
                 logger.warning(
-                    f"APIConnectionError ({self.provider}/{self.model}, scope={scope}, HTTP {status_code}, "
-                    f"attempt {attempt + 1}/{max_retries + 1}): {str(e)[:200]} [{describe_transport_error(e)}]"
+                    f"Connection error ({self.provider}/{self.model}, scope={scope}, HTTP {status_code}, "
+                    f"attempt {attempt + 1}/{max_retries + 1}): {describe_llm_error(e)}"
                 )
                 if attempt < max_retries:
                     await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
@@ -488,6 +496,9 @@ class OpenAIResponsesLLM(LLMInterface):
                 params["text"] = {"format": {"type": "json_object"}}
 
         apply_bank_attribution(params)
+        # opencode-go's /v1/responses requires x-opencode-session the same way
+        # /v1/chat/completions does (#4071); the host check inside decides.
+        apply_opencode_session(params, base_url=self.base_url)
 
         def parse(response: Any) -> Any:
             self._raise_if_truncated(response)
@@ -565,6 +576,16 @@ class OpenAIResponsesLLM(LLMInterface):
         else:
             request_tool_choice = tool_choice.mode.value
 
+        # OpenCode Go's /v1/responses rejects every tool_choice except the default
+        # with HTTP 400 ('only "auto" is supported'), so reflect's required/named
+        # choices failed every turn. Omit the field there. A named choice stays
+        # practically forced: its tools list was already narrowed to that one tool.
+        # Keyed on the host, not the provider name — deployments reach it as
+        # ``openai-responses`` with a custom base_url, and native OpenAI on the
+        # same provider name does honour these values.
+        if is_opencode_host(self.base_url) and tool_choice.mode is not LLMToolChoiceMode.AUTO:
+            request_tool_choice = None
+
         params: dict[str, Any] = {
             "model": self.model,
             "input": _messages_to_responses_input(messages),
@@ -587,6 +608,7 @@ class OpenAIResponsesLLM(LLMInterface):
             params["extra_body"] = {**self._config_extra_body}
 
         apply_bank_attribution(params)
+        apply_opencode_session(params, base_url=self.base_url)
 
         def parse(response: Any) -> LLMToolCallResult:
             self._raise_if_truncated(response)
@@ -603,7 +625,12 @@ class OpenAIResponsesLLM(LLMInterface):
                 except json.JSONDecodeError:
                     arguments = {"_raw": raw_args}
                 tool_calls.append(
-                    LLMToolCall(id=getattr(item, "call_id", None), name=getattr(item, "name", ""), arguments=arguments)
+                    # `call_id` is present on every function-call item this branch selects.
+                    LLMToolCall(
+                        id=cast(str, getattr(item, "call_id", None)),
+                        name=getattr(item, "name", ""),
+                        arguments=arguments,
+                    )
                 )
 
             content = response.output_text or None

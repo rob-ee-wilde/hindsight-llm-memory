@@ -16,8 +16,10 @@ NOTE: Observations are distinct from mental models (pinned reflections).
 """
 
 import asyncio
+import copy
 import json
 import logging
+import math
 import time
 import uuid
 from collections import defaultdict
@@ -27,16 +29,17 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from fnmatch import fnmatchcase
 from itertools import combinations
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import asyncpg
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from ...config import get_config
+from ...metrics import get_metrics_collector
 from ...worker.stage import set_stage
 from ..db import DatabaseBackend
 from ..db_utils import acquire_with_retry
-from ..llm_interface import OutputTooLongError, ProviderRateLimitResetError
+from ..llm_interface import OutputTooLongError, PromptCachePrefix, ProviderRateLimitResetError
 from ..llm_trace import (
     record_created_memory_ids,
     record_source_memory_ids,
@@ -45,8 +48,9 @@ from ..llm_trace import (
     trace_context_of,
 )
 from ..llm_wrapper import sanitize_llm_output
-from ..memories import FactRecord, get_memories
+from ..memories import StoredMemory, get_memories
 from ..memory_engine import Budget, fq_table
+from ..prompt_utils import truncate_context_for_prompt
 from ..retain import embedding_utils
 from .prompts import (
     build_consolidation_input,
@@ -54,12 +58,13 @@ from .prompts import (
 )
 
 if TYPE_CHECKING:
-    from asyncpg import Connection
-
+    # The engine's connection abstraction, which is what every caller passes; the annotations
+    # below named asyncpg's concrete type, which predates it.
     from ...api.http import RequestContext
+    from ..db.base import DatabaseConnection
     from ..memories.base import StoredMemory
     from ..memory_engine import MemoryEngine
-    from ..response_models import MemoryFact, RecallResult
+    from ..response_models import ConsolidationStrategiesPreview, MemoryFact, RecallResult
 
 logger = logging.getLogger(__name__)
 
@@ -100,25 +105,6 @@ async def _gather_or_cancel(coros: list[Any]) -> list[Any]:
         # still unwinding would reintroduce the very overlap this prevents.
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
-
-
-def _native_search_vector_update(config, param: str) -> str:
-    """UPDATE-clause fragment that repopulates ``search_vector`` inline, or ''
-    when the backend does not maintain a native tsvector column that way.
-
-    ``to_tsvector(...)::regconfig`` is PostgreSQL-only. On Oracle ``search_vector``
-    is a CLOB maintained by Oracle's own text index rather than an inline
-    tsvector, so emit nothing there (mirrors the insert path, which gates
-    ``search_vector`` on the PG-only ``pg_search_vector_expr``). Without this
-    guard the PG expression reaches Oracle and fails with DPY-4010 (the
-    ``::regconfig`` cast becomes an unbound ``:REGCONFIG`` placeholder).
-    """
-    from ..schema import _is_oracle  # noqa: PLC0415
-
-    if config.text_search_extension != "native" or _is_oracle():
-        return ""
-    lang = config.text_search_extension_native_language
-    return f",\n            search_vector = to_tsvector('{lang}'::regconfig, COALESCE({param}, ''))"
 
 
 def _norm_obs_text(text: str) -> str:
@@ -366,7 +352,6 @@ async def _apply_dedup_create_fold(
     conn,
     memory_engine: "MemoryEngine",
     bank_id: str,
-    config: Any,
     outcome: _DedupOutcome,
     create_source_ids: list[uuid.UUID],
     source_bounds: _TemporalBounds,
@@ -389,64 +374,34 @@ async def _apply_dedup_create_fold(
     if not outcome.should_merge or outcome.best_id is None:
         return None
 
-    # Fold the new source facts into the twin and persist the merged text. The SQL path keeps the
-    # twin's existing embedding (the merged text is >= threshold similar, so it stays
-    # representative and avoids a re-embed + a dialect-specific vector UPDATE).
-    store = get_memories()
     # Re-check liveness inside the write transaction; CREATE performed the slow embed/LLM
     # work off-connection, so sources may have been deleted since the decision was made.
     live_source_ids = await _filter_live_source_memories(conn, bank_id, create_source_ids)
     if not live_source_ids:
         return None
-    if not store.store_owned_for(bank_id):
-        # Oracle-safe: _native_search_vector_update emits the to_tsvector clause only for a
-        # native PG tsvector column, "" otherwise (see #3021 — the raw ::regconfig cast
-        # breaks Oracle). RETURNING-gate on the twin's probe-time text so a concurrent
-        # survivor rewrite during the connection-free LLM window can't be clobbered.
-        search_vector_clause = _native_search_vector_update(config, "$1")
-        folded = await conn.fetchval(
-            f"""
-            UPDATE {fq_table("memory_units")}
-            SET text = $1,
-                source_memory_ids = (SELECT array_agg(DISTINCT e) FROM unnest(source_memory_ids || $2::uuid[]) e),
-                proof_count = (SELECT count(DISTINCT e) FROM unnest(source_memory_ids || $2::uuid[]) e),
-                event_date = LEAST(event_date, COALESCE($5, event_date)),
-                occurred_start = LEAST(occurred_start, COALESCE($6, occurred_start)),
-                occurred_end = GREATEST(occurred_end, COALESCE($7, occurred_end)),
-                mentioned_at = GREATEST(mentioned_at, COALESCE($8, mentioned_at)),
-                updated_at = now(){search_vector_clause}
-            WHERE id = $3::uuid AND text = $4
-            RETURNING id
-            """,
-            outcome.merged_text,
-            live_source_ids,
-            uuid.UUID(outcome.best_id),
-            outcome.best_text,
-            source_bounds.event_date,
-            source_bounds.occurred_start,
-            source_bounds.occurred_end,
-            source_bounds.mentioned_at,
+    # Fold the new source facts into the twin and persist the merged text, gated on the twin's
+    # probe-time text so a concurrent survivor rewrite during the connection-free LLM window
+    # can't be clobbered.
+    folded = await get_memories().fold_sources_into_observation(
+        conn=conn,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        observation_id=outcome.best_id,
+        expected_text=outcome.best_text,
+        merged_text=outcome.merged_text,
+        source_memory_ids=live_source_ids,
+        bounds=source_bounds,
+        embeddings=memory_engine.embeddings,
+    )
+    if not folded:
+        # The twin vanished (or was rewritten) during the connection-free LLM window.
+        # Don't skip the CREATE: returning None lets the caller insert the observation
+        # so nothing is lost.
+        logger.debug(
+            "[CONSOLIDATION] dedup-merge target %s vanished before fold; proceeding with CREATE",
+            outcome.best_id[:8],
         )
-        if folded is None:
-            # The twin vanished (or was rewritten) during the connection-free LLM window.
-            # Don't skip the CREATE: returning None lets the caller insert the observation
-            # so nothing is lost.
-            logger.debug(
-                "[CONSOLIDATION] dedup-merge target %s vanished before fold; proceeding with CREATE",
-                outcome.best_id[:8],
-            )
-            return None
-    else:
-        await _reconcile_merge_via_store(
-            store,
-            conn,
-            memory_engine,
-            bank_id,
-            outcome.best_id,
-            outcome.merged_text,
-            live_source_ids,
-            source_bounds,
-        )
+        return None
     return outcome.best_id
 
 
@@ -475,78 +430,23 @@ async def _apply_dedup_update_fold(
     if not outcome.should_merge or outcome.best_id is None:
         return False
 
-    store = get_memories()
-    if not store.store_owned_for(bank_id):
-        # Snapshot the updated row's sources with a PLAIN read (no FOR UPDATE). Lock order
-        # must be sources-before-observation: _filter_live_source_memories below takes
-        # FOR SHARE on the SOURCE rows first, then the fold UPDATE locks the observation
-        # rows -- the same order as _apply_dedup_create_fold and the normal write paths
-        # (_apply_create_observation / _apply_update_action). Locking the observation
-        # here (FOR UPDATE) would invert that against the invalidation path and deadlock.
-        updated_row = await conn.fetchrow(
-            f"""
-            SELECT source_memory_ids
-            FROM {fq_table("memory_units")}
-            WHERE id = $1::uuid AND text = $2
-            """,
-            uuid.UUID(updated_id),
-            updated_text,
-        )
-        if updated_row is None:
-            return False
-        live_u_sources = await _filter_live_source_memories(conn, bank_id, list(updated_row["source_memory_ids"] or []))
-        if not live_u_sources:
-            return False
-        # Oracle-safe search_vector clause (#3021): "" unless a native PG tsvector column.
-        # RETURNING-gate on both rows' probe-time text so a survivor/updated rewrite during
-        # the connection-free LLM window can't be clobbered or fold a stale row.
-        search_vector_clause = _native_search_vector_update(config, "$1")
-        folded = await conn.fetchval(
-            f"""
-            UPDATE {fq_table("memory_units")} t
-            SET text = $1,
-                source_memory_ids = (
-                    SELECT array_agg(DISTINCT e) FROM unnest(t.source_memory_ids || $6::uuid[]) e
-                ),
-                proof_count = (
-                    SELECT count(DISTINCT e) FROM unnest(t.source_memory_ids || $6::uuid[]) e
-                ),
-                event_date = LEAST(t.event_date, COALESCE(u.event_date, t.event_date)),
-                occurred_start = LEAST(t.occurred_start, COALESCE(u.occurred_start, t.occurred_start)),
-                occurred_end = GREATEST(t.occurred_end, COALESCE(u.occurred_end, t.occurred_end)),
-                mentioned_at = GREATEST(t.mentioned_at, COALESCE(u.mentioned_at, t.mentioned_at)),
-                updated_at = now(){search_vector_clause}
-            FROM {fq_table("memory_units")} u
-            WHERE t.id = $2::uuid AND u.id = $3::uuid AND t.text = $4 AND u.text = $5
-            RETURNING t.id
-            """,
-            outcome.merged_text,
-            uuid.UUID(outcome.best_id),
-            uuid.UUID(updated_id),
-            outcome.best_text,
-            updated_text,
-            live_u_sources,
-        )
-        if folded is None:
-            # Twin or updated row vanished during the LLM window — keep the updated row
-            # as a distinct observation instead of deleting it unfolded.
-            return False
-    else:
-        updated_obs = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id])
-        updated_sources = list(updated_obs[0].source_memory_ids or []) if updated_obs else []
-        live_u_sources = await _filter_live_source_memories(conn, bank_id, updated_sources)
-        if not live_u_sources:
-            return False
-        await _reconcile_merge_via_store(
-            store,
-            conn,
-            memory_engine,
-            bank_id,
-            outcome.best_id,
-            outcome.merged_text,
-            live_u_sources,
-            _TemporalBounds.of(updated_obs[0]),
-        )
+    # Lock order is sources-before-observation, the same as the create fold and the normal
+    # write paths (_apply_create_observation / _apply_update_action); the store keeps it.
+    folded = await get_memories().fold_observation_into_twin(
+        conn=conn,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        observation_id=updated_id,
+        observation_text=updated_text,
+        twin_id=outcome.best_id,
+        twin_text=outcome.best_text,
+        merged_text=outcome.merged_text,
+        embeddings=memory_engine.embeddings,
+    )
+    if not folded:
+        # Nothing live to fold, or the twin / updated row vanished during the LLM window —
+        # keep the updated row as a distinct observation instead of deleting it unfolded.
+        return False
     await _execute_delete_action(conn, bank_id, updated_id)
     logger.info(
         "[CONSOLIDATION] dedup-merged updated observation %s into %s (cosine>=%.2f)",
@@ -727,7 +627,7 @@ def _scope_sort_key(scope: frozenset[str]) -> tuple[str, ...]:
 
 
 async def _filter_live_source_memories(
-    conn: "Connection",
+    conn: "DatabaseConnection",
     bank_id: str,
     source_memory_ids: list[uuid.UUID],
 ) -> list[uuid.UUID]:
@@ -744,24 +644,38 @@ async def _filter_live_source_memories(
     """
     if not source_memory_ids:
         return []
-    store = get_memories()
-    if not store.store_owned_for(bank_id):
-        rows = await conn.fetch(
-            f"SELECT id FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[]) AND bank_id = $2 FOR SHARE",
-            source_memory_ids,
-            bank_id,
-        )
-        live = {str(r["id"]) for r in rows}
-    else:
-        present = await store.get_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mid) for mid in source_memory_ids]
-        )
-        live = {str(m.unit_id) for m in present}
+    live = await get_memories().lock_live_memory_ids(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=source_memory_ids
+    )
     return [mid for mid in source_memory_ids if str(mid) in live]
 
 
+async def _sources_changed_since_read(
+    conn: "DatabaseConnection",
+    bank_id: str,
+    memories: list[dict[str, Any]],
+) -> list[str]:
+    """Ids of the batch's source facts edited since the batch read them (#4831).
+
+    The LLM decided on the facts as they were read; a fact edited meanwhile (a retag,
+    a curation) was already requeued by that edit, and its observations dropped. Writing
+    this response would rebuild them from the stale copy — under the old tags — and the
+    ``consolidated_at`` stamp would then undo the requeue. ``updated_at`` is the signal:
+    every edit stamps it and consolidation's own bookkeeping never does (META_UPDATED_AT).
+
+    Takes ``FOR SHARE`` on the rows, so an edit cannot land between this check and the
+    writes in the same transaction. A deleted fact is not "changed" — the per-action
+    liveness checks handle that. A store that keeps memories outside SQL reports no
+    ``updated_at`` on its reads, so it is not checked.
+    """
+    read_at: dict[str, datetime] = {str(m["id"]): m["updated_at"] for m in memories if m.get("updated_at") is not None}
+    if not read_at:
+        return []
+    return await get_memories().memories_changed_since(conn=conn, fq_table=fq_table, bank_id=bank_id, read_at=read_at)
+
+
 async def _any_live_source_memory(
-    conn: "Connection",
+    conn: "DatabaseConnection",
     bank_id: str,
     source_memory_ids: list[uuid.UUID],
 ) -> bool:
@@ -773,18 +687,17 @@ async def _any_live_source_memory(
     """
     if not source_memory_ids:
         return False
-    store = get_memories()
-    if not store.store_owned_for(bank_id):
-        found = await conn.fetchval(
-            f"SELECT 1 FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[]) AND bank_id = $2 LIMIT 1",
-            source_memory_ids,
-            bank_id,
-        )
-        return found is not None
-    present = await store.get_memories(
-        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mid) for mid in source_memory_ids]
+    return await get_memories().any_memory_exists(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=source_memory_ids
     )
-    return bool(present)
+
+
+def _unique_source_ids(v: str | list[str]) -> list[str]:
+    """Drop repeated ids, keeping order. A looping model can repeat one id thousands of
+    times, and every copy would be stored and re-sent to the next prompt (#4799)."""
+    if isinstance(v, str):
+        return [v]
+    return list(dict.fromkeys(v))
 
 
 class _CreateAction(BaseModel):
@@ -802,9 +715,7 @@ class _CreateAction(BaseModel):
     @field_validator("source_fact_ids", mode="before")
     @classmethod
     def ensure_list(cls, v: str | list[str]) -> list[str]:
-        if isinstance(v, str):
-            return [v]
-        return v
+        return _unique_source_ids(v)
 
 
 class _UpdateAction(BaseModel):
@@ -821,13 +732,28 @@ class _UpdateAction(BaseModel):
     @field_validator("source_fact_ids", mode="before")
     @classmethod
     def ensure_list(cls, v: str | list[str]) -> list[str]:
-        if isinstance(v, str):
-            return [v]
-        return v
+        return _unique_source_ids(v)
 
 
 class _DeleteAction(BaseModel):
-    observation_id: str  # UUID of the observation to remove
+    """One DELETE from an LLM response.
+
+    ``observation_id`` stays required — a delete naming no target has no defensible
+    fallback, and guessing one would remove the wrong observation. But rejecting the
+    entry rejects the ENTIRE ``_ConsolidationBatchResponse``, taking the batch's
+    perfectly good creates and updates with it (#4152), so a near-miss is worth
+    absorbing rather than paying a bisected re-run for: models that copy the
+    observation's own field name emit ``id``, which is unambiguous here because a
+    delete entry has exactly one identifier. ``populate_by_name`` keeps the
+    canonical name working for in-process construction, and the generated JSON
+    schema still advertises ``observation_id`` alone (pydantic emits the first
+    of the ``AliasChoices``), so what a grammar-constrained provider is told to
+    emit does not change — this only widens what a free-form one gets away with.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    observation_id: str = Field(validation_alias=AliasChoices("observation_id", "id"))
     reason: str = ""  # LLM's one-sentence justification (diagnostic only)
 
 
@@ -886,6 +812,10 @@ class _BatchLLMResult:
     obs_count: int = 0
     prompt_chars: int = 0
     failed: bool = False
+    #: How many attempts inside this batch call raised. Non-zero even when a later
+    #: attempt succeeded, so the run summary can report calls that were retried out
+    #: of existence — `failed` alone hides them (#4151).
+    failed_attempts: int = 0
 
 
 @dataclass
@@ -925,7 +855,7 @@ def _aggregate_source_fields(source_mems: list[dict[str, Any]], tags: list[str] 
 
 
 async def _count_observations_for_scope(
-    conn: "Connection",
+    conn: "DatabaseConnection",
     bank_id: str,
     tags: list[str],
 ) -> int:
@@ -934,38 +864,15 @@ async def _count_observations_for_scope(
     Returns the count of observations whose tags contain all specified tags.
     Observations with no tags are not counted (the limit does not apply to them).
     """
-    store = get_memories()
-    if not store.store_owned_for(bank_id):
-        return await conn.fetchval(
-            f"SELECT COUNT(*) FROM {fq_table('memory_units')} "
-            f"WHERE bank_id = $1 AND fact_type = 'observation' AND tags @> $2::varchar[]",
-            bank_id,
-            tags,
-        )
-    # A store that keeps observations outside Postgres: count them through it (tag containment).
-    total = 0
-    page_token = ""
-    for _ in range(100):
-        page = await store.scan_memories(
-            conn=conn,
-            fq_table=fq_table,
-            bank_id=bank_id,
-            fact_types=["observation"],
-            tags=tags or None,
-            tags_match="all",
-            limit=500,
-            page_token=page_token,
-        )
-        total += len(page.memories)
-        page_token = page.next_page_token
-        if not page_token:
-            break
-    return total
+    return await get_memories().count_observations_with_tags(conn=conn, fq_table=fq_table, bank_id=bank_id, tags=tags)
 
 
 @dataclass(frozen=True)
 class _ScopeLimitRule:
     """One ``observation_scope_limits`` rule: a scope pattern -> an observation cap.
+
+    DEPRECATED — superseded by :class:`_ConsolidationStrategy`, which carries the
+    mission too. Still honoured, but consulted only after the strategies.
 
     ``globs`` is a tuple of fnmatch tag-globs describing one consolidation scope.
     A concrete scope (the set of ``fact_tags`` for a consolidation pass) matches
@@ -1027,20 +934,219 @@ def _scope_matches_globs(globs: tuple[str, ...], tags: list[str]) -> bool:
     return True
 
 
+# Settings a consolidation strategy may override, in addition to the scopes it
+# claims. Kept to what actually varies per audience: the brief, how many
+# observations the scope may hold, and how much source evidence each consolidation
+# call is shown. Everything else stays bank-wide.
+_STRATEGY_INT_SETTINGS = (
+    "max_observations_per_scope",
+    "consolidation_source_facts_max_tokens",
+    "consolidation_source_facts_max_tokens_per_observation",
+)
+
+
+def _scope_contains_globs(globs: tuple[str, ...], tags: list[str]) -> bool:
+    """Containment match: every glob matches some tag; extra tags are allowed.
+
+    ``("company:*", "team:*")`` matches ``{company:acme, team:exec}`` and
+    ``{user:dana, team:exec, company:acme}``, but not ``{company:acme}``. The
+    untagged scope never matches, as with :func:`_scope_matches_globs`.
+    """
+    return bool(tags) and all(any(fnmatchcase(t, g) for t in tags) for g in globs)
+
+
+# How one scope pattern of a strategy matches a consolidation scope. Named after
+# the `tags_match` values recall already uses, so the vocabulary is the same:
+#   "all"   — the scope has all of the pattern's tags; other tags are allowed.
+#   "exact" — the scope has exactly the pattern's tags and nothing else.
+# "any" is deliberately absent: a strategy's patterns are already alternatives
+# (any one matching claims the scope), so "any of these tags" is written as one
+# pattern per tag.
+_STRATEGY_TAGS_MATCH = {"all": _scope_contains_globs, "exact": _scope_matches_globs}
+_DEFAULT_STRATEGY_TAGS_MATCH = "all"
+
+
+@dataclass(frozen=True)
+class _ScopePattern:
+    """One alternative in a strategy's ``scopes``: tag-globs plus how they match.
+
+    The mode is per pattern, not per strategy, so one strategy can mix them —
+    "exactly ``company:*``" OR "``team:*``, other tags allowed". A first version
+    had a single ``tags_match`` for the whole strategy, which forced a second
+    strategy (with duplicated settings) to express that.
+
+    ``"all"`` is the default because the common case is a scope retained with all
+    of a memory's tags together (``observation_scopes`` default ``combined``) —
+    ``{user:dana, team:exec, company:acme}`` — which a "company and team" pattern
+    should claim. The deprecated ``observation_scope_limits`` stays exact-only.
+    """
+
+    tags: tuple[str, ...]
+    tags_match: str = _DEFAULT_STRATEGY_TAGS_MATCH
+
+    def matches(self, fact_tags: list[str]) -> bool:
+        return _STRATEGY_TAGS_MATCH[self.tags_match](self.tags, fact_tags)
+
+
+def _parse_scope_pattern(raw: Any) -> _ScopePattern | None:
+    """``{"tags": [...], "tags_match": "all" | "exact"}`` -> pattern, or None.
+
+    Malformed patterns are dropped (see :func:`_parse_consolidation_strategies`).
+    An unknown mode falls back to the default rather than dropping the pattern —
+    same "never take consolidation down" rule as the rest.
+    """
+    if not isinstance(raw, dict):
+        return None
+    tags = raw.get("tags")
+    if not isinstance(tags, list) or not tags or not all(isinstance(g, str) and g for g in tags):
+        return None
+    tags_match = raw.get("tags_match")
+    if tags_match not in _STRATEGY_TAGS_MATCH:
+        tags_match = _DEFAULT_STRATEGY_TAGS_MATCH
+    return _ScopePattern(tags=tuple(tags), tags_match=tags_match)
+
+
+@dataclass(frozen=True)
+class _ConsolidationStrategy:
+    """One ``consolidation_strategies`` entry: the scopes it claims -> settings.
+
+    ``scopes`` are alternatives: a concrete scope (the ``fact_tags`` of one
+    consolidation pass) is claimed when *any* pattern matches it, each under its
+    own ``tags_match`` (see :class:`_ScopePattern`). Listing several is what lets
+    one strategy serve several scopes without being written out per scope.
+
+    Each setting is optional; ``None`` means "this strategy does not override
+    it" and the bank-wide value (the "Default" strategy in the control plane)
+    applies.
+    """
+
+    scopes: tuple[_ScopePattern, ...]
+    observations_mission: str | None = None
+    max_observations_per_scope: int | None = None
+    consolidation_source_facts_max_tokens: int | None = None
+    consolidation_source_facts_max_tokens_per_observation: int | None = None
+
+    def claims(self, fact_tags: list[str]) -> bool:
+        return any(pattern.matches(fact_tags) for pattern in self.scopes)
+
+
+def _parse_consolidation_strategies(raw: Any) -> list[_ConsolidationStrategy]:
+    """Parse the raw ``consolidation_strategies`` config into ordered strategies.
+
+    Defensive for the same reason as :func:`_parse_scope_limit_rules`: the config
+    round-trips as JSON through env and the bank-config API, so a malformed entry
+    (or a malformed setting or pattern within an otherwise valid entry) is dropped
+    rather than raised. An entry naming no usable scope, or ending up overriding
+    nothing, is dropped entirely. List order is preserved: it is the priority
+    order — see :func:`_strategy_for_scope`.
+    """
+    if not isinstance(raw, list):
+        return []
+    strategies: list[_ConsolidationStrategy] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        raw_scopes = entry.get("scopes")
+        if not isinstance(raw_scopes, list):
+            continue
+        scopes = tuple(p for p in (_parse_scope_pattern(scope) for scope in raw_scopes) if p is not None)
+        if not scopes:
+            continue
+        mission = entry.get("observations_mission")
+        if not isinstance(mission, str) or not mission.strip():
+            mission = None
+        ints: dict[str, int] = {}
+        for name in _STRATEGY_INT_SETTINGS:
+            value = entry.get(name)
+            # bool is an int subclass — reject True/False masquerading as a number.
+            if isinstance(value, int) and not isinstance(value, bool):
+                ints[name] = value
+        if mission is None and not ints:
+            continue
+        strategies.append(_ConsolidationStrategy(scopes=scopes, observations_mission=mission, **ints))
+    return strategies
+
+
+def _strategies_for(config: Any) -> list[_ConsolidationStrategy]:
+    return _parse_consolidation_strategies(getattr(config, "consolidation_strategies", None))
+
+
+def _strategy_for_scope(config: Any, fact_tags: list[str]) -> _ConsolidationStrategy | None:
+    """The one consolidation strategy that applies to a scope, if any.
+
+    **The first strategy in list order that claims the scope wins, whole.** When
+    two strategies both claim a scope (``["company:*"]`` and
+    ``["company:acme"]``, say), only the earlier one applies — its settings, and
+    for anything it leaves unset, the bank-wide value. A later strategy never
+    fills in the earlier one's gaps.
+
+    That is a deliberate change from the first version, which resolved each
+    setting separately (mission from the first strategy that set one, cap from
+    the first that set one). That let two strategies silently blend on one scope,
+    so nobody could tell which strategy a scope was actually using; with one
+    winner, the control plane can show it.
+
+    A strategy that sets nothing is dropped at parse time, so it never claims a
+    scope and never hides a later one.
+    """
+    return next((s for s in _strategies_for(config) if s.claims(fact_tags)), None)
+
+
 def _effective_scope_limit(config: Any, fact_tags: list[str]) -> int:
     """Resolve the observation cap for one concrete consolidation scope.
 
-    The first rule in ``observation_scope_limits`` whose pattern exact-covers
-    ``fact_tags`` wins; otherwise falls back to the bank-wide
-    ``max_observations_per_scope``. Wildcards live only here, matched against the
-    already-resolved concrete tags — the SQL count stays exact and indexed.
+    The winning strategy's cap (see :func:`_strategy_for_scope`) if it sets one;
+    otherwise the deprecated ``observation_scope_limits``, same matching; otherwise
+    the bank-wide ``max_observations_per_scope``. Wildcards live only here,
+    matched against the already-resolved concrete tags — the SQL count stays
+    exact and indexed.
     """
     if config is None:
         return -1
-    for rule in _parse_scope_limit_rules(config.observation_scope_limits):
-        if _scope_matches_globs(rule.globs, fact_tags):
-            return rule.limit
+    strategy = _strategy_for_scope(config, fact_tags)
+    if strategy is not None and strategy.max_observations_per_scope is not None:
+        return strategy.max_observations_per_scope
+    for limit_rule in _parse_scope_limit_rules(config.observation_scope_limits):
+        if _scope_matches_globs(limit_rule.globs, fact_tags):
+            return limit_rule.limit
     return config.max_observations_per_scope
+
+
+def _config_for_scope(config: Any, fact_tags: list[str]) -> Any:
+    """The bank config as one consolidation scope sees it.
+
+    The winning strategy's settings (see :func:`_strategy_for_scope` — first
+    claiming strategy wins, whole) over the bank-wide ones. The cap also honours
+    the deprecated ``observation_scope_limits`` (see :func:`_effective_scope_limit`).
+
+    Returning a whole config — rather than one resolver per setting, as the first
+    version did for the mission and cap — is what lets every downstream reader
+    (the related-observation recall that applies the source-facts token limits,
+    the prompt that carries the mission) pick up the scope's values without being
+    told about strategies. Same idea as ``apply_strategy`` for retain strategies.
+    Shallow copy + setattr rather than ``dataclasses.replace`` so it also works on
+    the lightweight config stand-ins tests pass in.
+
+    Safe because each resolved scope gets its own LLM call — see the pass loop's
+    ``obs_tags_override`` — so one scope's settings never reach another's call.
+    """
+    if config is None:
+        return None
+    scoped = copy.copy(config)
+    strategy = _strategy_for_scope(config, fact_tags)
+    if strategy is not None:
+        for name in (
+            "observations_mission",
+            "consolidation_source_facts_max_tokens",
+            "consolidation_source_facts_max_tokens_per_observation",
+        ):
+            value = getattr(strategy, name)
+            if value is not None:
+                setattr(scoped, name, value)
+    # The cap resolves separately: it also has to consult the deprecated
+    # observation_scope_limits.
+    scoped.max_observations_per_scope = _effective_scope_limit(config, fact_tags)
+    return scoped
 
 
 def _build_response_model(
@@ -1080,6 +1186,7 @@ class ConsolidationPerfLog:
         self.llm_calls: int = 0
         self.total_obs_in_context: int = 0
         self.total_prompt_chars: int = 0
+        self.llm_batch_failures: int = 0
 
     def log(self, message: str) -> None:
         """Add a log line."""
@@ -1099,6 +1206,10 @@ class ConsolidationPerfLog:
         self.llm_calls += 1
         self.total_obs_in_context += obs_count
         self.total_prompt_chars += prompt_chars
+
+    def record_llm_batch_failures(self, count: int) -> None:
+        """Record LLM batch attempts that raised, whether or not a retry rescued them."""
+        self.llm_batch_failures += count
 
     def merge_from(self, other: "ConsolidationPerfLog") -> None:
         """Merge a per-batch perf log into this (job-level) one.
@@ -1120,6 +1231,7 @@ class ConsolidationPerfLog:
         self.llm_calls += other.llm_calls
         self.total_obs_in_context += other.total_obs_in_context
         self.total_prompt_chars += other.total_prompt_chars
+        self.llm_batch_failures += other.llm_batch_failures
 
     def flush(self) -> None:
         """Flush all log lines to the logger."""
@@ -1149,48 +1261,32 @@ def _merge_max(a: "datetime | str | None", b: "datetime | str | None") -> "datet
     return a if b is None else b if a is None else max(a, b)
 
 
-async def _reconcile_merge_via_store(
-    store,
-    conn,
-    memory_engine: "MemoryEngine",
-    bank_id: str,
-    observation_id: str,
-    merged_text: str,
-    add_source_ids: list,
-    add_bounds: _TemporalBounds,
-) -> None:
-    """Dedup merge for a store that owns its rows: fold the extra source facts and the merged text
-    into the twin observation and re-upsert it, preserving its other fields. Re-embeds the merged
-    text because ``get_memories`` does not return the stored vector (the SQL path reuses it in
-    place instead).
+#: How many rounds' worth of candidates the fair fetch looks at before choosing one round.
+#: Whatever the window misses, the next round sees, so this trades a bigger read for fairness
+#: rather than for correctness.
+#: ponytail: fixed factor, make it configurable if a bank's groups are wider than 5 rounds.
+_FAIR_FETCH_OVERFETCH = 5
 
-    ``add_bounds`` are the folded-in side's dates, widened onto the twin exactly as the SQL
-    path's LEAST/GREATEST does."""
-    current = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id])
-    cur = current[0] if current else None
-    if cur is None:
-        return
-    merged_sources = list(dict.fromkeys([*(cur.source_memory_ids or []), *(str(s) for s in add_source_ids)]))
-    merged_bounds = _TemporalBounds.of(cur).merged_with(add_bounds)
-    embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [merged_text])
-    await store.upsert_observation(
-        conn=conn,
-        bank_id=bank_id,
-        record=FactRecord(
-            unit_id=observation_id,
-            text=merged_text,
-            embedding=str(embeddings[0]) if embeddings else None,
-            fact_type="observation",
-            tags=list(cur.tags or []),
-            proof_count=len(merged_sources),
-            source_memory_ids=merged_sources,
-            event_date=merged_bounds.event_date,
-            occurred_start=merged_bounds.occurred_start,
-            occurred_end=merged_bounds.occurred_end,
-            mentioned_at=merged_bounds.mentioned_at,
-            created_at=cur.created_at,
-        ),
-    )
+
+def _fair_group_slice(memories: list[StoredMemory], limit: int, quota: int) -> list[StoredMemory]:
+    """Oldest-first, but at most ``quota`` facts per consolidation group.
+
+    ``memories`` must already be sorted oldest-first: groups are then visited in the order
+    of their oldest fact, and the round fills from the front. Keying is
+    ``_consolidation_batch_key``, the same key the dispatcher groups by, so a round that
+    holds N keys gives the dispatcher N groups to run in parallel.
+    """
+    taken: list[StoredMemory] = []
+    seen: defaultdict[tuple[str, ...], int] = defaultdict(int)
+    for m in memories:
+        key = _consolidation_batch_key({"tags": list(m.tags or []), "observation_scopes": m.observation_scopes})
+        if seen[key] >= quota:
+            continue
+        seen[key] += 1
+        taken.append(m)
+        if len(taken) >= limit:
+            break
+    return taken
 
 
 async def _fetch_unconsolidated_rows(
@@ -1199,6 +1295,7 @@ async def _fetch_unconsolidated_rows(
     fact_types: list[str],
     limit: int,
     observation_scopes: list[list[str]] | None,
+    llm_parallelism: int,
 ) -> list[dict[str, Any]]:
     """Unconsolidated candidate facts, read through the memories store.
 
@@ -1207,16 +1304,31 @@ async def _fetch_unconsolidated_rows(
     consolidation silently produces no observations. Returns the same row-dict shape the
     consolidation loop consumes. Mirrors the job's scope filter: with scopes, OR each
     "tags ⊇ scope" and merge oldest-first; without, one unscoped read.
+
+    With ``llm_parallelism > 1`` the round is picked *fairly* across consolidation groups
+    instead of strictly oldest-first. A strict oldest-first round holds only the group that
+    owns the oldest facts, and the dispatcher parallelises across groups — one group in the
+    round means one LLM call at a time, whatever the parallelism, and a big group's backlog
+    starves every other group until it drains (#4823). So read a window of
+    ``_FAIR_FETCH_OVERFETCH`` rounds and take at most ``ceil(limit / llm_parallelism)`` facts
+    per group, leaving enough distinct groups in the round to fill the parallel slots. Facts
+    are still consumed oldest-first *within* a group, which is the ordering consolidation
+    actually depends on.
     """
     store = get_memories()
     scopes: list[list[str] | None] = list(observation_scopes) if observation_scopes else [None]
+    fair = llm_parallelism > 1
+    read_limit = limit * _FAIR_FETCH_OVERFETCH if fair else limit
     by_id: dict[str, Any] = {}
     for scope in scopes:
         for m in await store.find_unconsolidated(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=fact_types, limit=limit, scope_tags=scope
+            conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=fact_types, limit=read_limit, scope_tags=scope
         ):
             by_id.setdefault(m.unit_id, m)
-    ordered = sorted(by_id.values(), key=lambda m: (m.created_at is None, m.created_at))[:limit]
+    oldest_first = sorted(by_id.values(), key=lambda m: (m.created_at is None, m.created_at))
+    ordered = (
+        _fair_group_slice(oldest_first, limit, math.ceil(limit / llm_parallelism)) if fair else oldest_first[:limit]
+    )
     return [
         {
             "id": uuid.UUID(m.unit_id),
@@ -1228,6 +1340,8 @@ async def _fetch_unconsolidated_rows(
             "tags": list(m.tags or []),
             "mentioned_at": m.mentioned_at,
             "observation_scopes": m.observation_scopes,
+            # Read-time version: the write re-checks it (see _sources_changed_since_read).
+            "updated_at": m.updated_at,
         }
         for m in ordered
     ]
@@ -1455,6 +1569,11 @@ async def _run_consolidation_job(
         "actions_executed": 0,
         "skipped": 0,
         "memories_failed": 0,
+        # LLM batch attempts that raised, including those a retry or the adaptive bisection
+        # later rescued. `memories_failed` counts only facts left stuck, so it reads 0 for
+        # a run that discarded every response it got (#4151, #4152). One batch call can
+        # contribute several attempts, so this is not bounded by the batch count.
+        "llm_batch_failures": 0,
     }
 
     # Track all unique tags from consolidated memories for mental model refresh filtering
@@ -1488,7 +1607,12 @@ async def _run_consolidation_job(
         async with acquire_with_retry(pool) as conn:
             t0 = time.time()
             memories = await _fetch_unconsolidated_rows(
-                conn, bank_id, ["experience", "world"], fetch_limit, observation_scopes
+                conn,
+                bank_id,
+                ["experience", "world"],
+                fetch_limit,
+                observation_scopes,
+                max(1, config.consolidation_llm_parallelism),
             )
             perf.record_timing("fetch_memories", time.time() - t0)
 
@@ -1598,7 +1722,8 @@ async def _run_consolidation_job(
                         # an earlier scope's write and the stamp never commit apart (#3876).
                         is_final_pass = pass_index == len(obs_tags_list) - 1
                         pass_results, pass_deleted, pass_failed = await _process_memory_batch(
-                            pool=pool,
+                            # Optional on the caller only because the engine clears its backend on close.
+                            pool=cast("DatabaseBackend", pool),
                             memory_engine=memory_engine,
                             llm_config=llm_config,
                             bank_id=bank_id,
@@ -1641,7 +1766,8 @@ async def _run_consolidation_job(
                                     }
                 else:
                     sub_results, sub_deleted, sub_llm_failed = await _process_memory_batch(
-                        pool=pool,
+                        # Optional on the caller only because the engine clears its backend on close.
+                        pool=cast("DatabaseBackend", pool),
                         memory_engine=memory_engine,
                         llm_config=llm_config,
                         bank_id=bank_id,
@@ -1707,9 +1833,7 @@ async def _run_consolidation_job(
 
             cancelled_local = False
             if operation_id and not await memory_engine._check_op_alive(operation_id):
-                logger.info(
-                    f"[CONSOLIDATION] bank={bank_id} operation {operation_id} cancelled (bank deleted), stopping early"
-                )
+                logger.info(f"[CONSOLIDATION] bank={bank_id} operation {operation_id} cancelled, stopping early")
                 cancelled_local = True
 
             # Per-batch local stats; merged into outer state once, serially,
@@ -1959,6 +2083,22 @@ async def _run_consolidation_job(
     if timing_parts:
         perf.log(f"[4] Timing breakdown: {', '.join(timing_parts)}")
 
+    # A run whose LLM calls kept failing schema validation looks exactly like a clean one
+    # from the counters above: adaptive bisection rescues the facts, so nothing is left
+    # carrying `consolidation_failed_at`, while everything those responses would have done
+    # -- notably their deletes -- was thrown away (#4151, #4152). Say so, loudly, and only
+    # when it happened, so a healthy summary is unchanged.
+    stats["llm_batch_failures"] = perf.llm_batch_failures
+    if perf.llm_batch_failures:
+        # Attempts, not batches: one batch call can burn up to `consolidation_max_attempts`
+        # of them, so this can exceed the batch count above rather than being a share of it.
+        perf.log(
+            f"[5] WARNING: {perf.llm_batch_failures} LLM batch attempt(s) failed and their responses were "
+            f"discarded (creates, updates AND deletes alike). Facts the retry/bisection path rescued are NOT "
+            f"reflected in failed_consolidation; see hindsight.consolidation.batch_failures for the "
+            f"per-class breakdown."
+        )
+
     # Trigger mental-model refreshes once, when the chain has fully drained. On a
     # round-limited round we skip and carry the affected tags forward (above); the
     # final round flushes the accumulated union, so a model whose memories were
@@ -1995,21 +2135,20 @@ async def _run_consolidation_job(
     return {"status": "completed", "bank_id": bank_id, **stats}
 
 
-# SQL predicate: "this mental model's refresh scope can contain untagged memories".
+# SQL predicate: "an untagged write can make this mental model stale".
 #
 # A model's scope is NOT its ``tags`` column — it is whatever
-# ``_resolve_refresh_tag_filtering`` resolves, and both the refresh and the staleness
-# check use that. Three cases reach untagged memories:
+# ``_mental_model_stale_scope`` resolves from it and the trigger. Two cases reach
+# untagged memories:
 #   - no tags at all             -> no tag constraint, every bank memory is in scope
-#   - tags_match "any" / "all"   -> non-strict, the clause ORs in untagged rows
-#   - trigger.tag_groups         -> overrides the tags column entirely, so the column
-#                                   says nothing about what the model can see
-# A tagged model left on the default (``all_strict``) is correctly excluded: strict
-# matching drops untagged rows, so an untagged-only consolidation cannot make it stale.
-# Gating on the tags column alone starved the first two cases (#3053).
-_MM_SCOPE_REACHES_UNTAGGED = (
-    "((tags IS NULL OR tags = '{}') OR (trigger->>'tags_match') IN ('any', 'all') OR trigger ? 'tag_groups')"
-)
+#   - trigger.tag_groups         -> overrides the tags column entirely, and a group can
+#                                   select untagged rows on purpose (``not``, an empty
+#                                   ``exact`` leaf)
+# Gating on the tags column alone starved both, plus tagged "any"/"all" models (#3053).
+# Those tagged models are excluded again since #4857: their refresh still *reads*
+# untagged memories, but staleness counts only writes carrying their tags, so an
+# untagged-only consolidation can never make them stale and asking would be wasted.
+_MM_SCOPE_REACHES_UNTAGGED = "((tags IS NULL OR tags = '{}') OR trigger ? 'tag_groups')"
 
 
 async def _trigger_mental_model_refreshes(
@@ -2098,13 +2237,18 @@ async def _trigger_mental_model_refreshes(
             # skip_if_in_flight: a consolidation chain fires this every round and
             # overlapping consolidations can run on the same bank, so a model still
             # pending/processing a refresh must not be enqueued a second time (#3411).
-            await memory_engine.submit_async_refresh_mental_model(
+            result = await memory_engine.submit_async_refresh_mental_model(
                 bank_id=bank_id,
                 mental_model_id=mental_model_id,
                 request_context=request_context,
                 skip_if_in_flight=True,
                 automatic=True,
             )
+            if result.get("paused"):
+                logger.info(
+                    f"[CONSOLIDATION] Skipped refresh for mental model {mental_model_id}: its last refresh failed"
+                )
+                continue
             refreshed_count += 1
             logger.info(
                 f"[CONSOLIDATION] Triggered refresh for mental model {mental_model_id} "
@@ -2155,6 +2299,20 @@ async def _process_memory_batch(
     # Map the source memories this batch consumes onto the consolidation trace.
     record_source_memory_ids([str(m["id"]) for m in memories])
 
+    # Determine effective tag scope for observations.
+    # When obs_tags_override is set, use it; otherwise use the memory's own tags.
+    if obs_tags_override is not None:
+        fact_tags = obs_tags_override
+    else:
+        # All memories in the batch share the same tag set (enforced by batching)
+        fact_tags = memories[0].get("tags") or [] if memories else []
+
+    # Everything below — the related-observation recall, the cap, the prompt — reads
+    # the config as this scope sees it, so a consolidation strategy claiming the
+    # scope applies to the whole pass. Resolved before the recall because the recall
+    # applies the source-facts token limits a strategy may override.
+    config = _config_for_scope(config, fact_tags)
+
     # 1. Parallel recalls — one per fact
     # When obs_tags_override is set, use it as the observation scope for all facts.
     t0 = time.time()
@@ -2166,6 +2324,7 @@ async def _process_memory_batch(
             query=m["text"],
             request_context=request_context,
             tags=observation_scope_tags if observation_scope_tags is not None else (m.get("tags") or []),
+            config=config,
         )
         for m in memories
     ]
@@ -2194,14 +2353,6 @@ async def _process_memory_batch(
                 union_observations.append(obs)
         if recall_result.source_facts:
             union_source_facts.update(recall_result.source_facts)
-
-    # Determine effective tag scope for observations.
-    # When obs_tags_override is set, use it; otherwise use the memory's own tags.
-    if obs_tags_override is not None:
-        fact_tags = obs_tags_override
-    else:
-        # All memories in the batch share the same tag set (enforced by batching)
-        fact_tags = memories[0].get("tags") or [] if memories else []
 
     # 2b. Compute remaining observation slots for this scope (if limit configured).
     # The cap is resolved per-scope: an observation_scope_limits rule may override
@@ -2236,6 +2387,7 @@ async def _process_memory_batch(
     if perf:
         perf.record_timing("llm", time.time() - t0)
         perf.record_llm_call(llm_result.obs_count, llm_result.prompt_chars)
+        perf.record_llm_batch_failures(llm_result.failed_attempts)
 
     # 4. Prepare every action connection-free, then apply them all in ONE transaction.
     #
@@ -2418,6 +2570,16 @@ async def _process_memory_batch(
     if prepared_deletes or prepared_updates or prepared_creates or stamp_ids:
         async with acquire_with_retry(pool) as conn:
             async with conn.transaction():
+                changed_ids = await _sources_changed_since_read(conn, bank_id, memories)
+                if changed_ids:
+                    # Drop the whole response, stamps included: the facts stay pending and the
+                    # job's next fetch re-reads them as they are now (#4831).
+                    logger.info(
+                        f"[CONSOLIDATION] bank={bank_id} discarding batch of {len(memories)}: "
+                        f"{len(changed_ids)} source fact(s) edited since read, e.g. {changed_ids[0]}"
+                    )
+                    prepared_deletes, prepared_updates, prepared_creates, stamp_ids = [], [], [], []
+
                 for observation_id in prepared_deletes:
                     await _execute_delete_action(conn=conn, bank_id=bank_id, observation_id=observation_id)
                     deleted_count += 1
@@ -2452,7 +2614,6 @@ async def _process_memory_batch(
                             conn,
                             memory_engine,
                             bank_id,
-                            config,
                             prepared_create.dedup,
                             prepared_create.source_memory_ids,
                             _TemporalBounds.of(prepared_create.agg),
@@ -2541,7 +2702,7 @@ class _ObservationHistorySnapshot:
 
 
 async def _append_observation_history(
-    conn: "Connection",
+    conn: "DatabaseConnection",
     bank_id: str,
     observation_id: str,
     snapshot: _ObservationHistorySnapshot,
@@ -2619,7 +2780,6 @@ async def _apply_update_action(
     embedding_str = prepared.embedding_str
 
     config = get_config()
-    search_vector_clause = _native_search_vector_update(config, "$1")
     store = get_memories()
 
     # FOR SHARE liveness + the write share the batch's transaction, so a concurrent
@@ -2633,108 +2793,60 @@ async def _apply_update_action(
         return None
     live_ids = live_source_memory_ids
 
+    # Recall predates the LLM/embedding work, so the snapshot's tags may be stale (#4831):
+    # merging them would drop tags added since and bring back tags removed since. Merge
+    # into the observation's current tags, held until the caller commits.
+    current_tags = await store.lock_observation_tags(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, observation_id=observation_id
+    )
+    if current_tags is None:
+        logger.debug(f"Update skipped: observation {observation_id} no longer exists")
+        return None
+
     history_entry = _ObservationHistorySnapshot(
         previous_text=model.text,
-        previous_tags=list(model.tags or []),
+        previous_tags=current_tags,
         previous_occurred_start=model.occurred_start,
         previous_occurred_end=model.occurred_end,
         previous_mentioned_at=model.mentioned_at,
         new_source_memory_ids=[str(mid) for mid in live_ids],
     )
 
-    source_ids = list(model.source_fact_ids or []) + live_ids
+    # Stored ids are strings, fresh ones are UUIDs: normalise before dropping repeats.
+    merged = dict.fromkeys(str(s) for s in [*(model.source_fact_ids or []), *live_ids])
+    source_ids = [uuid.UUID(s) for s in merged]
 
     # SECURITY: Merge source fact's tags into existing observation tags so all contributors can see it
-    existing_tags = set(model.tags or [])
+    existing_tags = set(current_tags)
     source_tags = set(source_fact_tags or [])
     merged_tags = list(existing_tags | source_tags)
 
     t0 = time.time()
-    if not store.store_owned_for(bank_id):
-        # Unlike the dedup folds this statement also runs on Oracle, where LEAST/GREATEST
-        # return NULL as soon as ANY argument is NULL (PostgreSQL ignores NULL arguments).
-        # The inner COALESCE covers a NULL *parameter*; the outer one covers a NULL
-        # *column* — an observation with no occurred interval yet, which is precisely the
-        # #3477 case. Without it Oracle would compute LEAST(NULL, <source date>) = NULL and
-        # silently drop the date it was told to inherit. Keep the inner
-        # ``COALESCE($n, col)`` spelled exactly like this: the Oracle driver shim keys its
-        # TIMESTAMP-TZ input-size hint off that pattern (db/oracle.py::_apply_clob_input_sizes),
-        # and a NULL parameter binds as VARCHAR2 (ORA-00932) without it.
-        updated_rows = await conn.execute_rows_affected(
-            f"""
-            UPDATE {fq_table("memory_units")}
-            SET text = $1,
-                embedding = $2::vector,
-                source_memory_ids = $3,
-                proof_count = $4,
-                tags = $10,
-                updated_at = now(),
-                event_date = COALESCE(LEAST(event_date, COALESCE($6, event_date)), $6),
-                occurred_start = COALESCE(LEAST(occurred_start, COALESCE($7, occurred_start)), $7),
-                occurred_end = COALESCE(GREATEST(occurred_end, COALESCE($8, occurred_end)), $8),
-                mentioned_at = COALESCE(GREATEST(mentioned_at, COALESCE($9, mentioned_at)), $9){search_vector_clause}
-            WHERE id = $5
-            """,
-            new_text,
-            embedding_str,
-            source_ids,
-            len(source_ids),
-            uuid.UUID(observation_id),
-            source_bounds.event_date,
-            source_bounds.occurred_start,
-            source_bounds.occurred_end,
-            source_bounds.mentioned_at,
-            merged_tags,
+    rewritten = await store.rewrite_observation(
+        conn=conn,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        observation_id=observation_id,
+        text=new_text,
+        embedding=embedding_str,
+        source_memory_ids=source_ids,
+        tags=merged_tags,
+        bounds=source_bounds,
+        previous=model,
+    )
+    # The source-liveness checks above guard the *source* memories; the
+    # observation row itself can still be invalidated/deleted
+    # concurrently, matching 0 rows. Bail out BEFORE the observation_history
+    # INSERT below — that INSERT carries an observation_id FK onto memory_units,
+    # so appending history for a now-missing row raises ForeignKeyViolationError,
+    # a non-retryable integrity failure that would fail the whole consolidation
+    # op for a row that simply no longer exists.
+    if not rewritten:
+        logger.debug(
+            f"Update skipped: observation {observation_id} no longer exists "
+            "(deleted/invalidated concurrently); not appending history"
         )
-        # The source-liveness checks above guard the *source* memories; the
-        # observation row itself (WHERE id = $5) can still be invalidated/deleted
-        # concurrently, matching 0 rows. Bail out BEFORE the observation_history
-        # INSERT below — that INSERT carries an observation_id FK onto memory_units,
-        # so appending history for a now-missing row raises ForeignKeyViolationError,
-        # a non-retryable integrity failure that would fail the whole consolidation
-        # op for a row that simply no longer exists.
-        if updated_rows == 0:
-            logger.debug(
-                f"Update skipped: observation {observation_id} no longer exists "
-                "(deleted/invalidated concurrently); not appending history"
-            )
-            return None
-    else:
-        # Upsert overwrites the whole observation, so start from its current state (fetched
-        # from the store) and apply the same merge the SQL does — LEAST/GREATEST on the
-        # times — while preserving fields the update never touches (created_at).
-        current = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id])
-        cur = current[0] if current else None
-        # Widen the row the store still holds. If it has vanished, fall back to the
-        # pre-update recall snapshot — ISO strings, and no event_date on that model.
-        current_bounds = (
-            _TemporalBounds.of(cur)
-            if cur
-            else _TemporalBounds(
-                occurred_start=_as_dt(model.occurred_start),
-                occurred_end=_as_dt(model.occurred_end),
-                mentioned_at=_as_dt(model.mentioned_at),
-            )
-        )
-        merged_bounds = current_bounds.merged_with(source_bounds)
-        await store.upsert_observation(
-            conn=conn,
-            bank_id=bank_id,
-            record=FactRecord(
-                unit_id=observation_id,
-                text=new_text,
-                embedding=embedding_str,
-                fact_type="observation",
-                tags=merged_tags,
-                proof_count=len(source_ids),
-                source_memory_ids=[str(s) for s in source_ids],
-                event_date=merged_bounds.event_date,
-                occurred_start=merged_bounds.occurred_start,
-                occurred_end=merged_bounds.occurred_end,
-                mentioned_at=merged_bounds.mentioned_at,
-                created_at=cur.created_at if cur else None,
-            ),
-        )
+        return None
 
     # Record the pre-update snapshot in the dedicated observation_history table
     # (one row per change), then trim to the configured cap. History lived in a
@@ -2809,20 +2921,14 @@ async def _apply_create_action(
 
 
 async def _execute_delete_action(
-    conn: "Connection",
+    conn: "DatabaseConnection",
     bank_id: str,
     observation_id: str,
 ) -> None:
     """Delete a superseded or contradicted observation."""
-    store = get_memories()
-    if not store.store_owned_for(bank_id):
-        await conn.execute(
-            f"DELETE FROM {fq_table('memory_units')} WHERE id = $1 AND bank_id = $2 AND fact_type = 'observation'",
-            uuid.UUID(observation_id),
-            bank_id,
-        )
-    else:
-        await store.delete_facts(bank_id, [observation_id])
+    await get_memories().delete_observation(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, observation_id=observation_id
+    )
     # History lives in Postgres regardless of where the observation itself does, and no
     # longer cascades from memory_units (that FK was dropped so it could be recorded for
     # observations kept outside SQL). Drop it explicitly so a deleted observation's
@@ -2859,6 +2965,7 @@ async def _find_related_observations(
     query: str,
     request_context: "RequestContext",
     tags: list[str] | None = None,
+    config: Any = None,
 ) -> "RecallResult":
     """
     Find observations related to the given query using optimized recall.
@@ -2879,7 +2986,12 @@ async def _find_related_observations(
     # max_tokens naturally limits how many observations are returned
     from ...tracing import get_tracer, is_tracing_enabled
 
-    config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
+    # The consolidation pass hands in the config already resolved for its scope, so
+    # a consolidation strategy's source-facts token limits reach this recall.
+    # Resolving the bank config here instead (as this function used to always do)
+    # would silently ignore them.
+    if config is None:
+        config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
 
     # SECURITY: Use all_strict matching if tags provided to prevent cross-scope consolidation
     tags_match = "all_strict" if tags else "any"
@@ -2933,10 +3045,12 @@ def _build_observations_for_llm(
     """Serialize MemoryFact observations into dicts for the consolidation LLM prompt."""
     obs_list = []
     for obs in observations:
+        # Rows written before #4799 may repeat an id thousands of times; show each source once.
+        unique_ids = list(dict.fromkeys(obs.source_fact_ids or []))
         obs_data: dict[str, Any] = {
             "id": obs.id,
             "text": obs.text,
-            "proof_count": len(obs.source_fact_ids or []) or 1,
+            "proof_count": len(unique_ids) or 1,
         }
         if obs.occurred_start:
             obs_data["occurred_start"] = obs.occurred_start
@@ -2945,13 +3059,13 @@ def _build_observations_for_llm(
         if obs.mentioned_at:
             obs_data["mentioned_at"] = obs.mentioned_at
         source_memories = []
-        for sid in obs.source_fact_ids or []:
+        for sid in unique_ids:
             sf = source_facts.get(sid)
             if sf is None:
                 continue
             sf_data: dict[str, Any] = {"text": sf.text}
             if sf.context:
-                sf_data["context"] = sf.context
+                sf_data["context"] = truncate_context_for_prompt(sf.context)
             if sf.occurred_start:
                 sf_data["occurred_start"] = sf.occurred_start
             if sf.occurred_end:
@@ -3131,20 +3245,10 @@ async def _consolidate_batch_with_llm(
         observation_capacity_note=observation_capacity_note,
     )
 
-    # Opt into context caching of the stable system prefix when the provider
-    # supports it (gemini/vertexai with the flag on). response_schema is NOT
-    # passed to the fingerprint: it varies per batch (max_creates) but is not
-    # part of the cached prefix, so keying on it would needlessly bust the cache.
-    cached_prefix_name: str | None = None
-    provider_impl = getattr(llm_config, "_provider_impl", None)
-    if provider_impl is not None and provider_impl.supports_prompt_caching():
-        try:
-            cached_prefix_name = await provider_impl.get_or_create_cached_prefix(
-                system_instruction=system_prompt,
-            )
-        except Exception:
-            logger.exception("Consolidation cache prefix lookup failed; falling back to uncached call")
-            cached_prefix_name = None
+    # Opt into context caching of the stable system prefix. response_schema is
+    # NOT part of the cache key: it varies per batch (max_creates) but is not part
+    # of the cached prefix, so keying on it would needlessly bust the cache.
+    prompt_cache = PromptCachePrefix(system_instruction=system_prompt)
 
     # Use a constrained response model when observation limit is active
     response_model = _build_response_model(
@@ -3156,6 +3260,7 @@ async def _consolidate_batch_with_llm(
     inner_max_retries = config.consolidation_llm_max_retries
     last_exc: Exception | None = None
     attempts_made = 0
+    failed_attempts = 0
     # Pre-compute a stable identifier set for the batch so failure logs name the
     # exact memories whose consolidation is failing — without this, an opaque
     # "LLM batch call failed" line gives operators no way to find the offending
@@ -3182,6 +3287,7 @@ async def _consolidate_batch_with_llm(
                 # structured output -- which narrows the raw-JSON failure mode behind #2668 --
                 # without forcing strict schema on operations whose model can't satisfy it.
                 "strict_schema": config.llm_strict_schema_consolidation,
+                "prompt_cache": prompt_cache,
             }
             # Only request an explicit output budget when configured. Left unset by default the key is
             # omitted, so each provider keeps its implicit default (backwards compatible). Operators on
@@ -3191,8 +3297,6 @@ async def _consolidate_batch_with_llm(
                 call_kwargs["max_completion_tokens"] = config.consolidation_max_completion_tokens
             if inner_max_retries is not None:
                 call_kwargs["max_retries"] = inner_max_retries
-            if cached_prefix_name is not None:
-                call_kwargs["cached_prefix"] = cached_prefix_name
             batch_call = await llm_config.call(**call_kwargs)
             response: _ConsolidationBatchResponse = batch_call.content
             # Defensive truncation: some LLM providers may not enforce JSON schema max_length
@@ -3211,9 +3315,19 @@ async def _consolidate_batch_with_llm(
                 deletes=response.deletes,
                 obs_count=len(union_observations),
                 prompt_chars=len(system_prompt) + len(user_content),
+                failed_attempts=failed_attempts,
             )
         except Exception as exc:
             failure_class = _classify_batch_failure(exc)
+            # Count every failed call, including the ones adaptive bisection goes on to
+            # rescue. `failed_consolidation` cannot show those — it is a gauge over rows
+            # still carrying `consolidation_failed_at` when the run ends — so without this
+            # a run that burned N schema-invalid calls and dropped every delete they
+            # carried reads exactly like a clean one (#4151, #4152). Exception path only.
+            get_metrics_collector().record_consolidation_batch_failure(
+                failure_class=str(failure_class), error_type=type(exc).__name__
+            )
+            failed_attempts += 1
             if failure_class is _BatchFailureClass.PROPAGATE:
                 logger.warning(
                     f"[CONSOLIDATION] LLM batch call for {batch_label} raised a non-batch failure "
@@ -3243,7 +3357,10 @@ async def _consolidate_batch_with_llm(
         f"{batch_label}, skipping batch (the caller will bisect it). Last error: {last_exc}"
     )
     return _BatchLLMResult(
-        obs_count=len(union_observations), prompt_chars=len(system_prompt) + len(user_content), failed=True
+        obs_count=len(union_observations),
+        prompt_chars=len(system_prompt) + len(user_content),
+        failed=True,
+        failed_attempts=failed_attempts,
     )
 
 
@@ -3276,9 +3393,9 @@ async def _apply_create_observation(
     obs_tags = tags or []
     observation_id = uuid.uuid4()
 
-    # Write the observation. A SQL store keeps it as a `memory_units` row (inline below, with the
-    # search_vector the configured backend needs); a store that owns its rows takes it through
-    # upsert_observation as a normal Observation-type memory carrying all of its own state.
+    # Write the observation. A SQL store keeps it as a `memory_units` row (with the
+    # search_vector the configured backend needs); a store that owns its rows takes it
+    # as a normal Observation-type memory carrying all of its own state.
     store = get_memories()
     # FOR SHARE liveness + INSERT share the batch's transaction, so a concurrent
     # delete cannot orphan the new observation between the check and the insert.
@@ -3286,95 +3403,27 @@ async def _apply_create_observation(
     if not live_source_memory_ids:
         logger.debug(f"Create skipped: all {len(source_memory_ids)} source memories were deleted concurrently")
         return {"action": "skipped", "reason": "sources_deleted"}
-    source_memory_ids = live_source_memory_ids
+    # Each source once: the store stores len() of this list as proof_count. It used to
+    # write a literal 1, so a multi-source observation was undercounted until updated (#4955).
+    source_memory_ids = list(dict.fromkeys(live_source_memory_ids))
 
     t0 = time.time()
-    if not store.store_owned_for(bank_id):
-        # Query varies based on text search backend.
-        from ..schema import _is_oracle  # noqa: PLC0415
-
-        config = get_config()
-        if config.text_search_extension == "vchord":
-            # VectorChord: manually tokenize and insert search_vector
-            query = f"""
-                INSERT INTO {fq_table("memory_units")} (
-                    id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
-                    tags, event_date, occurred_start, occurred_end, mentioned_at, search_vector
-                )
-                VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10,
-                        tokenize($3, 'llmlingua2')::bm25_catalog.bm25vector)
-                RETURNING id
-            """
-        elif config.text_search_extension == "native" and not _is_oracle():
-            # Native (PostgreSQL): search_vector is populated with to_tsvector()
-            # using the configured native language dictionary, matching the batch
-            # insert path in ops_postgresql.insert_facts_batch. On Oracle this falls
-            # through to the no-search_vector branch below (Oracle maintains its text
-            # index separately; to_tsvector/::regconfig is PG-only — see #3021).
-            query = f"""
-                INSERT INTO {fq_table("memory_units")} (
-                    id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
-                    tags, event_date, occurred_start, occurred_end, mentioned_at, search_vector
-                )
-                VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10,
-                        to_tsvector('{config.text_search_extension_native_language}'::regconfig, COALESCE($3, '')))
-                RETURNING id
-            """
-        else:  # pg_textsearch, pgroonga, pg_search, and Oracle: base text columns / separate index
-            query = f"""
-                INSERT INTO {fq_table("memory_units")} (
-                    id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
-                    tags, event_date, occurred_start, occurred_end, mentioned_at
-                )
-                VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10)
-                RETURNING id
-            """
-
-        row = await conn.fetchrow(
-            query,
-            observation_id,
-            bank_id,
-            observation_text,
-            embedding_str,
-            source_memory_ids,
-            obs_tags,
-            obs_event_date,
-            obs_occurred_start,
-            obs_occurred_end,
-            obs_mentioned_at,
-        )
-        created_id = row["id"]
-
-        # Populate observation_sources junction table (Oracle only — PG uses native array ops).
-        if memory_engine._backend.ops.uses_observation_sources_table and source_memory_ids:
-            await conn.executemany(
-                f"""
-                INSERT INTO {fq_table("observation_sources")} (observation_id, source_id)
-                VALUES ($1, $2)
-                ON CONFLICT (observation_id, source_id) DO NOTHING
-                """,
-                [(observation_id, sid) for sid in dict.fromkeys(source_memory_ids)],
-            )
-    else:
-        await store.upsert_observation(
-            conn=conn,
-            bank_id=bank_id,
-            record=FactRecord(
-                unit_id=str(observation_id),
-                text=observation_text,
-                embedding=embedding_str,
-                fact_type="observation",
-                tags=list(obs_tags),
-                proof_count=1,
-                source_memory_ids=[str(s) for s in source_memory_ids],
-                event_date=obs_event_date,
-                occurred_start=obs_occurred_start,
-                occurred_end=obs_occurred_end,
-                mentioned_at=obs_mentioned_at,
-                created_at=now,
-            ),
-        )
-        created_id = observation_id
+    created_id = await store.insert_observation(
+        conn=conn,
+        ops=memory_engine._backend.ops,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        observation_id=observation_id,
+        text=observation_text,
+        embedding=embedding_str,
+        source_memory_ids=source_memory_ids,
+        tags=obs_tags,
+        event_date=obs_event_date,
+        occurred_start=obs_occurred_start,
+        occurred_end=obs_occurred_end,
+        mentioned_at=obs_mentioned_at,
+        created_at=now,
+    )
 
     if perf:
         perf.record_timing("db_write", time.time() - t0)
@@ -3382,3 +3431,99 @@ async def _apply_create_observation(
     logger.debug(f"Created observation {observation_id} from {len(source_memory_ids)} memories (tags: {obs_tags})")
 
     return {"action": "created", "observation_id": str(created_id), "tags": obs_tags}
+
+
+def preview_consolidation_strategies(
+    raw_strategies: list[Any],
+    scopes: list[tuple[list[str], int]],
+    *,
+    sample_limit: int,
+    complete: bool,
+) -> "ConsolidationStrategiesPreview":
+    """Which of ``scopes`` (``(tags, observation_count)``, most populous first) each
+    strategy would apply to — using the same parsing, matching and
+    first-strategy-wins rule consolidation uses, so the control plane never
+    re-implements them.
+
+    Aligned by position with ``raw_strategies``: a strategy the server would drop
+    (no usable rule, or nothing set) keeps its slot, marked inactive, because the
+    editor shows the list as typed. Each strategy is parsed on its own for that
+    reason — parsing the list at once would shift every index after a dropped one.
+    Pure: no I/O, so the endpoint's cost is the one scope query plus this loop.
+    """
+    from ..response_models import (
+        ConsolidationStrategiesPreview,
+        DefaultScopesPreview,
+        StrategyPreview,
+        StrategyRulePreview,
+        StrategyScopePreview,
+    )
+
+    parsed = [(_parse_consolidation_strategies([entry]) or [None])[0] for entry in raw_strategies]
+
+    # Match every rule against every scope exactly once, then derive both the
+    # per-rule counts and each scope's winner from those hit sets. Matching twice
+    # (once for winners via Strategy.claims, once per rule) doubled the work, and
+    # this runs on the event loop as the user types. A strategy claims a scope when
+    # any of its *valid* rules hits it — the same thing Strategy.claims computes.
+    rule_patterns: list[list[_ScopePattern | None]] = []
+    rule_hits: list[list[list[int]]] = []
+    for entry in raw_strategies:
+        raw_rules = entry.get("scopes") if isinstance(entry, dict) else None
+        patterns = [_parse_scope_pattern(raw_rule) for raw_rule in (raw_rules if isinstance(raw_rules, list) else [])]
+        rule_patterns.append(patterns)
+        rule_hits.append(
+            [
+                [k for k, (tags, _) in enumerate(scopes) if pattern.matches(tags)] if pattern is not None else []
+                for pattern in patterns
+            ]
+        )
+
+    winners: list[int | None] = [None] * len(scopes)
+    for i, strategy in enumerate(parsed):
+        if strategy is None:
+            continue
+        for hits in rule_hits[i]:
+            for k in hits:
+                if winners[k] is None:
+                    winners[k] = i
+    # A scope is won by the *earliest* claiming strategy; iterating strategies in
+    # order and never overwriting gives exactly that.
+
+    def sample(indices: list[int]) -> list[StrategyScopePreview]:
+        return [
+            StrategyScopePreview(tags=scopes[k][0], count=scopes[k][1], handled_by=winners[k])
+            for k in indices[:sample_limit]
+        ]
+
+    strategies: list[StrategyPreview] = []
+    for i in range(len(raw_strategies)):
+        rules: list[StrategyRulePreview] = []
+        for pattern, hits in zip(rule_patterns[i], rule_hits[i]):
+            rules.append(
+                StrategyRulePreview(
+                    match_count=len(hits),
+                    taken_count=sum(1 for k in hits if winners[k] != i),
+                    observation_count=sum(scopes[k][1] for k in hits),
+                    samples=sample(hits),
+                )
+            )
+        strategies.append(
+            StrategyPreview(
+                active=parsed[i] is not None,
+                claimed_count=sum(1 for winner in winners if winner == i),
+                rules=rules,
+            )
+        )
+
+    unclaimed = [k for k, winner in enumerate(winners) if winner is None]
+    return ConsolidationStrategiesPreview(
+        strategies=strategies,
+        default=DefaultScopesPreview(
+            match_count=len(unclaimed),
+            observation_count=sum(scopes[k][1] for k in unclaimed),
+            samples=sample(unclaimed),
+        ),
+        scopes_scanned=len(scopes),
+        complete=complete,
+    )

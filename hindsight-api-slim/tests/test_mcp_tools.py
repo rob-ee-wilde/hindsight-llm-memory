@@ -8,8 +8,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pydantic import ValidationError
 
+from hindsight_api.api import page_markdown
 from hindsight_api.engine.memory_engine import KEEP_PARENT, DirectivePage, MentalModelPage
 from hindsight_api.mcp_tools import (
+    _ALL_TOOLS,
     KNOWLEDGE_ROOT_PARENT,
     MCPToolsConfig,
     MentalModelTriggerInput,
@@ -173,6 +175,10 @@ _KNOWLEDGE_PAGE: dict[str, Any] = {
 def mock_memory():
     """Create a mock MemoryEngine with all MCP tool methods."""
     memory = MagicMock()
+    # Tools given an explicit `bank_id=` resolve it through the engine (the session
+    # bank is resolved at the transport edge instead, so most tools never call this).
+    # A bank reached by its own id resolves to itself.
+    memory.resolve_bank_alias = AsyncMock(side_effect=lambda bank_id, **_: bank_id)
 
     # Mental model methods — simulate engine detail filtering
     async def _list_mental_models(**kwargs):
@@ -242,6 +248,7 @@ def mock_memory():
     memory.list_tags = AsyncMock(return_value={"items": ["tag1", "tag2"], "total": 2})
     memory._ensure_bank_exists = AsyncMock(return_value=True)
     memory.get_bank_profile = AsyncMock(return_value={"id": "test-bank", "name": "Test Bank", "mission": "Testing"})
+    memory.ensure_bank_profile = AsyncMock(return_value={"id": "test-bank", "name": "Test Bank", "mission": "Testing"})
     memory.get_bank_stats = AsyncMock(return_value={"nodes": 100, "links": 50})
     memory.delete_bank = AsyncMock(return_value={"deleted_memories": 10, "deleted_entities": 5})
 
@@ -673,28 +680,24 @@ class TestGetMentalModel:
 
 
 @pytest.mark.asyncio
-class TestListMentalModelsDetail:
-    """Test the detail parameter for list_mental_models."""
+class TestListMentalModelsMetadataOnly:
+    """list_mental_models is metadata-only: it never returns synthesized content.
 
-    async def test_list_detail_full_includes_reflect_response(self, mcp_server_with_mental_models, mock_memory):
-        result = await _tools(mcp_server_with_mental_models)["list_mental_models"].fn(detail="full")
-        parsed = json.loads(result)
-        item = parsed["items"][0]
-        assert "reflect_response" in item
-        assert "content" in item
-        assert "source_query" in item
+    Listing used to default to full content, which bloated an agent's context and
+    let one call pull a whole bank's synthesized knowledge in bulk. The tool now
+    returns metadata (id/name/tags/staleness); content comes from get_mental_model.
+    """
 
-    async def test_list_detail_content_excludes_reflect_response(self, mcp_server_with_mental_models, mock_memory):
-        result = await _tools(mcp_server_with_mental_models)["list_mental_models"].fn(detail="content")
-        parsed = json.loads(result)
-        item = parsed["items"][0]
-        assert "reflect_response" not in item
-        assert "content" in item
-        assert "source_query" in item
-        assert "trigger" in item
+    async def test_list_has_no_detail_param(self, mcp_server_with_mental_models):
+        # The content-listing capability is gone: there is no way to ask the tool
+        # for content, so an agent cannot bulk-read a bank via the list tool.
+        import inspect
 
-    async def test_list_detail_metadata_only_has_core_fields(self, mcp_server_with_mental_models, mock_memory):
-        result = await _tools(mcp_server_with_mental_models)["list_mental_models"].fn(detail="metadata")
+        fn = _tools(mcp_server_with_mental_models)["list_mental_models"].fn
+        assert "detail" not in inspect.signature(fn).parameters
+
+    async def test_list_returns_metadata_only(self, mcp_server_with_mental_models, mock_memory):
+        result = await _tools(mcp_server_with_mental_models)["list_mental_models"].fn()
         parsed = json.loads(result)
         item = parsed["items"][0]
         assert item["id"] == "mm-1"
@@ -705,14 +708,14 @@ class TestListMentalModelsDetail:
         assert "reflect_response" not in item
         assert "trigger" not in item
 
-    async def test_list_detail_default_is_full(self, mcp_server_with_mental_models, mock_memory):
-        result = await _tools(mcp_server_with_mental_models)["list_mental_models"].fn()
-        parsed = json.loads(result)
-        item = parsed["items"][0]
-        assert "reflect_response" in item
+    async def test_list_requests_metadata_and_staleness_from_engine(self, mcp_server_with_mental_models, mock_memory):
+        await _tools(mcp_server_with_mental_models)["list_mental_models"].fn()
+        kwargs = mock_memory.list_mental_models.await_args.kwargs
+        assert kwargs["detail"] == "metadata"
+        assert kwargs["with_staleness"] is True
 
-    async def test_list_detail_single_bank_metadata(self, mcp_server_single_bank, mock_memory):
-        result = await _tools(mcp_server_single_bank)["list_mental_models"].fn(detail="metadata")
+    async def test_list_single_bank_metadata_only(self, mcp_server_single_bank, mock_memory):
+        result = await _tools(mcp_server_single_bank)["list_mental_models"].fn()
         assert isinstance(result, dict)
         item = result["items"][0]
         assert "id" in item
@@ -792,7 +795,10 @@ class TestCreateMentalModel:
         call_kwargs = mock_memory.create_mental_model.call_args.kwargs
         assert call_kwargs["name"] == "Test Model"
         assert call_kwargs["source_query"] == "What are the user's preferences?"
-        assert call_kwargs["content"] == "Generating content..."
+        assert call_kwargs["content"] == "", (
+            "a page is created with an empty body — a placeholder string would be embedded "
+            "and BM25-indexed, making a brand-new page searchable as its own placeholder"
+        )
         # Verify async refresh was scheduled
         mock_memory.submit_async_refresh_mental_model.assert_called_once()
         assert mock_memory.submit_async_refresh_mental_model.call_args.kwargs["mental_model_id"] == "mm-new"
@@ -1677,6 +1683,15 @@ class TestDocumentTools:
         result = await _tools(mcp)["list_documents"].fn()
         assert isinstance(result, dict)
 
+    @pytest.mark.parametrize("tool", ["list_documents", "list_tags"])
+    @pytest.mark.parametrize("include_bank_id", [True, False])
+    async def test_list_pages_with_offset(self, mock_memory, tool, include_bank_id):
+        """#4859: documents and tags page with offset, like their HTTP endpoints."""
+        mcp = _make_mcp_server(mock_memory, {tool}, include_bank_id=include_bank_id)
+        await _tools(mcp)[tool].fn(limit=10, offset=20)
+        call_kwargs = getattr(mock_memory, tool).call_args.kwargs
+        assert call_kwargs["offset"] == 20
+
 
 # =========================================================================
 # Operation Tool Tests
@@ -1712,6 +1727,56 @@ class TestOperationTools:
         result = await _tools(mcp)["list_operations"].fn()
         assert isinstance(result, dict)
 
+    @pytest.mark.parametrize("include_bank_id", [True, False])
+    async def test_list_operations_pages_and_filters_like_http(self, mock_memory, include_bank_id):
+        """#4859: MCP takes the same offset / type / exclude_parents as the HTTP endpoint."""
+        mcp = _make_mcp_server(mock_memory, {"list_operations"}, include_bank_id=include_bank_id)
+        await _tools(mcp)["list_operations"].fn(type="refresh_mental_model", limit=50, offset=250, exclude_parents=True)
+        call_kwargs = mock_memory.list_operations.call_args.kwargs
+        assert call_kwargs["task_type"] == "refresh_mental_model"
+        assert call_kwargs["limit"] == 50
+        assert call_kwargs["offset"] == 250
+        assert call_kwargs["exclude_parents"] is True
+
+
+@pytest.mark.asyncio
+class TestListToolBounds:
+    """#4859: list tools reject the same limit/offset values their HTTP endpoints reject."""
+
+    @pytest.fixture
+    def mock_memory(self, mock_memory):
+        # call_tool runs the bank tool filter first; leave every tool enabled.
+        mock_memory._config_resolver.get_bank_config = AsyncMock(return_value={})
+        mock_memory._operation_validator = None
+        return mock_memory
+
+    @pytest.mark.parametrize(
+        "tool,args",
+        [
+            ("list_operations", {"limit": 101}),
+            ("list_operations", {"limit": 0}),
+            ("list_mental_models", {"limit": 1001}),
+            ("list_directives", {"limit": 1001}),
+            ("list_memories", {"limit": -1}),
+            ("list_documents", {"offset": -1}),
+            ("list_tags", {"offset": -1}),
+            ("list_banks", {"offset": -1}),
+        ],
+    )
+    async def test_out_of_range_is_rejected(self, mock_memory, tool, args):
+        from pydantic import ValidationError
+
+        mcp = _make_mcp_server(mock_memory, {tool}, include_bank_id=True)
+        with pytest.raises(ValidationError):
+            await mcp.call_tool(tool, args)
+        engine_method = "list_memory_units" if tool == "list_memories" else tool
+        getattr(mock_memory, engine_method).assert_not_called()
+
+    async def test_limit_at_the_http_max_is_accepted(self, mock_memory):
+        mcp = _make_mcp_server(mock_memory, {"list_operations"}, include_bank_id=True)
+        await mcp.call_tool("list_operations", {"limit": 100})
+        assert mock_memory.list_operations.call_args.kwargs["limit"] == 100
+
 
 # =========================================================================
 # Tags & Bank Tool Tests
@@ -1731,21 +1796,21 @@ class TestTagsAndBankTools:
         mcp = _make_mcp_server(mock_memory, {"get_bank"}, include_bank_id=True)
         result = await _tools(mcp)["get_bank"].fn()
         assert '"test-bank"' in result or "test-bank" in result
-        assert mock_memory.get_bank_profile.call_args.kwargs["create_if_missing"] is False
+        mock_memory.ensure_bank_profile.assert_not_awaited()  # the read must not create the bank
 
     async def test_get_bank_missing_does_not_create(self, mock_memory):
         mock_memory.get_bank_profile.return_value = None
         mcp = _make_mcp_server(mock_memory, {"get_bank"}, include_bank_id=True)
         result = await _tools(mcp)["get_bank"].fn(bank_id="missing-bank")
         assert json.loads(result)["error"] == "Bank 'missing-bank' not found"
-        assert mock_memory.get_bank_profile.call_args.kwargs["create_if_missing"] is False
+        mock_memory.ensure_bank_profile.assert_not_awaited()  # the read must not create the bank
 
     async def test_create_bank_uses_public_profile_api(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"create_bank"}, include_bank_id=True)
         result = await _tools(mcp)["create_bank"].fn(bank_id="new-bank")
         assert '"test-bank"' in result or "test-bank" in result
-        mock_memory.get_bank_profile.assert_awaited_once()
-        assert mock_memory.get_bank_profile.call_args.args[0] == "new-bank"
+        mock_memory.ensure_bank_profile.assert_awaited_once()
+        assert mock_memory.ensure_bank_profile.call_args.args[0] == "new-bank"
         mock_memory.update_bank.assert_not_awaited()
         mock_memory._ensure_bank_exists.assert_not_awaited()
 
@@ -1761,7 +1826,7 @@ class TestTagsAndBankTools:
         assert mock_memory.update_bank.call_args.args[0] == "new-bank"
         assert mock_memory.update_bank.call_args.kwargs["name"] == "New Bank"
         assert mock_memory.update_bank.call_args.kwargs["mission"] == "Help the user"
-        mock_memory.get_bank_profile.assert_not_awaited()
+        mock_memory.ensure_bank_profile.assert_not_awaited()
         mock_memory._ensure_bank_exists.assert_not_awaited()
 
     async def test_get_bank_stats(self, mock_memory):
@@ -1807,14 +1872,14 @@ class TestTagsAndBankTools:
         mcp = _make_mcp_server(mock_memory, {"get_bank"}, include_bank_id=False)
         result = await _tools(mcp)["get_bank"].fn()
         assert isinstance(result, dict)
-        assert mock_memory.get_bank_profile.call_args.kwargs["create_if_missing"] is False
+        mock_memory.ensure_bank_profile.assert_not_awaited()  # the read must not create the bank
 
     async def test_get_bank_single_bank_missing_does_not_create(self, mock_memory):
         mock_memory.get_bank_profile.return_value = None
         mcp = _make_mcp_server(mock_memory, {"get_bank"}, include_bank_id=False)
         result = await _tools(mcp)["get_bank"].fn()
         assert result["error"] == "Bank 'test-bank' not found"
-        assert mock_memory.get_bank_profile.call_args.kwargs["create_if_missing"] is False
+        mock_memory.ensure_bank_profile.assert_not_awaited()  # the read must not create the bank
 
     async def test_delete_bank_single_bank(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"delete_bank"}, include_bank_id=False)
@@ -2140,6 +2205,21 @@ class TestKnowledgeBaseTools:
         assert result["markdown"].startswith("---\n")
         assert "Run `make deploy`." in result["markdown"]
 
+    async def test_get_page_with_no_body_yet_says_so(self, mock_memory):
+        """The read surface has to pass notice_when_empty, not just support it.
+
+        The flag defaults to off, so dropping it at the call site returns a document
+        that is frontmatter and nothing else — which an agent reads as a page that
+        failed to render rather than one nobody has written, and answers by creating
+        a second page for the topic. Search already says it; reading must agree.
+        """
+        mock_memory.get_knowledge_page.return_value = dict(_KNOWLEDGE_PAGE, content="")
+        mcp = _make_mcp_server(mock_memory, {"get_knowledge_page"}, include_bank_id=True)
+
+        result = json.loads(await _tools(mcp)["get_knowledge_page"].fn(page_id="kp-1"))
+
+        assert page_markdown.EMPTY_PAGE_NOTICE in result["markdown"]
+
     async def test_get_page_not_found(self, mock_memory):
         mock_memory.get_knowledge_page.return_value = None
         mcp = _make_mcp_server(mock_memory, {"get_knowledge_page"}, include_bank_id=True)
@@ -2344,6 +2424,7 @@ class TestKnowledgeBaseTools:
 def mock_memory_with_resolver():
     """Create a mock MemoryEngine with config resolver for bank filtering tests."""
     memory = MagicMock()
+    memory.resolve_bank_alias = AsyncMock(side_effect=lambda bank_id, **_: bank_id)
     memory.retain_batch_async = AsyncMock()
     memory.recall_async = AsyncMock(
         return_value=MagicMock(
@@ -2551,6 +2632,40 @@ class TestReflectTraceOmission:
         assert "directives_applied" not in data
 
 
+def _refs(node: Any) -> set[str]:
+    """Every $defs name a schema fragment points at, at any depth."""
+    if isinstance(node, dict):
+        found = {node["$ref"].rsplit("/", 1)[-1]} if isinstance(node.get("$ref"), str) else set()
+        return found.union(*(_refs(v) for v in node.values()))
+    if isinstance(node, list):
+        return set().union(*(_refs(v) for v in node))
+    return set()
+
+
+def test_no_tool_input_schema_is_recursive(mock_memory):
+    """Some LLM providers reject a recursive tool schema and fail the whole request (#5013)."""
+    from fastmcp import FastMCP
+
+    mcp = FastMCP("test")
+    register_mcp_tools(
+        mcp,
+        mock_memory,
+        MCPToolsConfig(bank_id_resolver=lambda: "b", include_bank_id_param=True, tools=set(_ALL_TOOLS)),
+    )
+    tools = _tools(mcp)
+    assert {"create_mental_model", "create_knowledge_page"} <= tools.keys()
+    for name, tool in tools.items():
+        defs = tool.parameters.get("$defs", {})
+        for start in defs:
+            seen, todo = set(), set(_refs(defs[start]))
+            while todo:
+                ref = todo.pop()
+                assert ref != start, f"{name}: $defs/{start} refers back to itself"
+                if ref not in seen:
+                    seen.add(ref)
+                    todo |= _refs(defs.get(ref, {}))
+
+
 class TestMentalModelTriggerInput:
     """The MCP trigger input contract: HTTP parity, patch shape, merge semantics."""
 
@@ -2572,6 +2687,16 @@ class TestMentalModelTriggerInput:
     def test_rejects_unknown_field(self):
         with pytest.raises(ValidationError):
             MentalModelTriggerInput(refresh_evry_hour=True)
+
+    def test_rejects_malformed_tag_groups(self):
+        """tag_groups is plain JSON in the schema, so the shape is checked by the validator."""
+        with pytest.raises(ValidationError):
+            MentalModelTriggerInput(tag_groups=[{"and": "not-a-list"}])
+
+    def test_tag_groups_reach_the_engine_in_canonical_form(self):
+        """The field name 'filters' is accepted and sent down under its alias, as before #5013."""
+        trigger = MentalModelTriggerInput(tag_groups=[{"filters": [{"tags": ["a"]}, {"not": {"tags": ["b"]}}]}])
+        assert trigger.tag_groups == [{"and": [{"tags": ["a"]}, {"not": {"tags": ["b"]}}]}]
 
     def test_rejects_invalid_cron(self):
         with pytest.raises(ValidationError):

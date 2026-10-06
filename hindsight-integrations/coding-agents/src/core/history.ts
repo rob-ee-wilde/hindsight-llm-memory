@@ -495,6 +495,16 @@ export function importLocalHistory(
     case "copilot-cli":
     case "devin-cli":
       return { supported: false, reason: `${harness} ${SQLITE_HISTORY}`, sessions: [] };
+    // TraeCode has no reader for the same reason as ZCode below: no session files on disk at all
+    // (sessions live in an encrypted local DB / the cloud), which is why the plugin journals live
+    // sessions itself (core/turn-journal.ts) — and why there is no past history to backfill from.
+    case "traecode":
+    case "zcode":
+      return {
+        supported: false,
+        reason: `${harness} keeps no session transcripts on disk to import`,
+        sessions: [],
+      };
     default:
       return { supported: false, reason: `no local history reader for ${harness}`, sessions: [] };
   }

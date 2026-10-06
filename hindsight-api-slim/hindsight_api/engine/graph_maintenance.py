@@ -50,13 +50,6 @@ from typing import TYPE_CHECKING
 
 from ..models import RequestContext
 from .db.base import DatabaseConnection
-
-# Re-exported for callers and tests that import the link caps from here; the caps
-# themselves live with the link builders the relink pass mirrors — the temporal one
-# with the retain-time builders, the semantic one with the store's relink pass — so
-# there is a single definition of each and the two cannot drift.
-from .memories.pg.graph import MAX_SEMANTIC_LINKS_PER_UNIT  # noqa: F401
-from .retain.link_utils import MAX_TEMPORAL_LINKS_PER_UNIT  # noqa: F401
 from .schema import fq_table
 
 if TYPE_CHECKING:
@@ -170,6 +163,11 @@ async def enqueue_entity_prune_candidates(
 
     Over-enqueueing costs nothing: the drain re-checks each candidate and keeps
     the ones still referenced.
+
+    This is also where the entities get their ``mention_count`` back: the
+    counter is incremented once per mention at retain time and would otherwise
+    never come down, so an entity's prominence would track how often its
+    documents were rewritten rather than how many facts mention it (#4291).
 
     Delegated to the memories store: a store that never wrote ``unit_entities``
     has no postings to lose and returns 0.

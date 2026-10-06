@@ -1,7 +1,8 @@
 """Tests for per-operation LLM concurrency caps.
 
 These tests exercise the dispatch logic in `llm_wrapper` that gates calls on
-per-operation semaphores when `HINDSIGHT_API_{RETAIN,REFLECT,CONSOLIDATION}_LLM_MAX_CONCURRENT`
+per-operation semaphores when
+`HINDSIGHT_API_{RETAIN,REFLECT,CONSOLIDATION,MENTAL_MODEL_REFRESH}_LLM_MAX_CONCURRENT`
 is set. They patch the module-level semaphore registry so they can run without
 needing to re-import the module with custom env vars.
 """
@@ -15,6 +16,7 @@ import httpx
 import pytest
 from openai import APIConnectionError
 
+from hindsight_api.config import clear_config_cache
 from hindsight_api.engine import llm_wrapper
 from hindsight_api.engine.llm_wrapper import (
     LLMProvider,
@@ -36,10 +38,13 @@ class TestScopeToOperation:
             ("reflect_structured", "reflect"),
             ("reflect_tool_call", "reflect"),
             ("consolidation", "consolidation"),
+            # The background mental-model refresh is its own bucket, not reflect's.
+            ("refresh_mental_model", "mental_model_refresh"),
+            ("dry_run_refresh_mental_model", "mental_model_refresh"),
+            ("mental_model_delta_ops", "mental_model_refresh"),
             # Out-of-bucket scopes — only the global cap applies.
             ("memory_think", None),
             ("bank_mission", None),
-            ("mental_model_delta_ops", None),
             ("verification", None),
             ("", None),
         ],
@@ -90,7 +95,16 @@ class TestSemaphoresForScope:
 
 
 class TestBuildPerOpSemaphores:
-    """`_build_per_op_semaphores()` reads env vars and validates them."""
+    """`_build_per_op_semaphores()` reads the resolved config and validates it.
+
+    Each case clears the config cache after setting the environment: the caps come
+    from HindsightConfig now, so the env only takes effect once the config is rebuilt.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_config(self):
+        """Leave no rebuilt config behind for the next test to inherit."""
+        yield
 
     def test_empty_when_no_env_vars(self, monkeypatch):
         monkeypatch.delenv("HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT", raising=False)

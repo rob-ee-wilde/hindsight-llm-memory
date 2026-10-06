@@ -58,6 +58,12 @@ export const HARNESS_LOGO_REGISTRY: Record<string, HarnessLogoEntry> = {
   },
   codex: { id: "codex", label: "Codex", src: "/img/harness/codex.svg", invertOnDark: true },
   dcode: { id: "dcode", label: "DeepAgents Dcode", src: "/img/harness/dcode.svg" },
+  "factory-droid": {
+    id: "factory-droid",
+    label: "Factory Droid",
+    src: "/img/harness/factory-droid.svg",
+    invertOnDark: true,
+  },
   "copilot-cli": {
     id: "copilot-cli",
     label: "GitHub Copilot CLI",
@@ -88,6 +94,15 @@ export const HARNESS_LOGO_REGISTRY: Record<string, HarnessLogoEntry> = {
   // tile with a white glyph, so it stays legible on dark — inverting it would
   // burn a white square into the row.
   "grok-build": { id: "grok-build", label: "Grok Build", src: "/img/harness/grok-build.svg" },
+  // Moonshot's branding-guide `k-only-light` mark: a black K with a blue dot.
+  // Inverted on dark so the K stays legible; the dot turns orange there, which
+  // beats an invisible glyph.
+  "kimi-code": {
+    id: "kimi-code",
+    label: "Kimi Code",
+    src: "/img/harness/kimi-code.svg",
+    invertOnDark: true,
+  },
   kilo: { id: "kilo", label: "Kilo CLI", src: "/img/harness/kilo.svg" },
   opencode: { id: "opencode", label: "OpenCode", src: "/img/harness/opencode.png" },
   // opencode v2 ships as a separate `opencode2` binary alongside v1 and reports
@@ -105,6 +120,10 @@ export const HARNESS_LOGO_REGISTRY: Record<string, HarnessLogoEntry> = {
     src: "/img/harness/prime-agent.svg",
     invertOnDark: true,
   },
+  zcode: { id: "zcode", label: "ZCode", src: "/img/harness/zcode.svg" },
+  traecode: { id: "traecode", label: "TraeCode", src: "/img/harness/traecode.png" },
+  workbuddy: { id: "workbuddy", label: "WorkBuddy", src: "/img/harness/workbuddy.png" },
+  codebuddy: { id: "codebuddy", label: "CodeBuddy", src: "/img/harness/codebuddy.png" },
 };
 
 const HARNESS_TAG_PREFIX = "harness:";

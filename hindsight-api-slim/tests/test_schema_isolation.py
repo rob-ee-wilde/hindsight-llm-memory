@@ -11,7 +11,8 @@ import uuid
 import pytest
 import pytest_asyncio
 
-from hindsight_api.engine.memory_engine import _current_schema, fq_table
+from hindsight_api.engine.memory_engine import _current_schema
+from hindsight_api.engine.schema import fq_store_table
 from hindsight_api.extensions import RequestContext, TenantContext, TenantExtension
 from hindsight_api.migrations import run_migrations
 
@@ -122,7 +123,7 @@ class TestSchemaIsolation:
             tenant_request = RequestContext(api_key=f"key-{schema_name}")
             await memory._authenticate_tenant(tenant_request)
 
-            # Now fq_table will use the correct schema
+            # Now fq_store_table will use the correct schema
             pool = await memory._get_pool()
             from hindsight_api.engine.db_utils import acquire_with_retry
 
@@ -131,7 +132,7 @@ class TestSchemaIsolation:
                 for i in range(3):
                     await conn.execute(
                         f"""
-                        INSERT INTO {fq_table("memory_units")} (bank_id, text, event_date, fact_type)
+                        INSERT INTO {fq_store_table("memory_units")} (bank_id, text, event_date, fact_type)
                         VALUES ($1, $2, now(), 'world')
                         """,
                         bank_id,
@@ -201,8 +202,8 @@ class TestSchemaIsolation:
                 if current != schema_name:
                     errors.append(f"Expected {schema_name}, got {current}")
 
-                # Verify fq_table uses correct schema
-                table = fq_table("memory_units")
+                # Verify fq_store_table uses correct schema
+                table = fq_store_table("memory_units")
                 expected = f"{schema_name}.memory_units"
                 if table != expected:
                     errors.append(f"Expected {expected}, got {table}")
@@ -254,6 +255,17 @@ class TestSchemaIsolation:
         conn = await asyncpg.connect(pg0_db_url)
         try:
             for schema in schemas:
+                # The bank row goes in per schema too: list_memory_units 404s for a bank
+                # nobody created (#4175), and "created" is per tenant schema — which is
+                # part of what this test is about.
+                await conn.execute(
+                    f"""
+                    INSERT INTO "{schema}".banks (bank_id, name, disposition, mission, internal_id)
+                    VALUES ($1, $1, '{{"skepticism": 3, "literalism": 3, "empathy": 3}}'::jsonb, '', gen_random_uuid())
+                    ON CONFLICT (bank_id) DO NOTHING
+                    """,
+                    bank_id,
+                )
                 await conn.execute(
                     f"""
                     INSERT INTO "{schema}".memory_units (bank_id, text, event_date, fact_type)
@@ -355,14 +367,14 @@ class TestSchemaIsolation:
                 tenant_request = RequestContext(api_key=f"key-{schema}")
                 await memory._authenticate_tenant(tenant_request)
 
-                # Insert using fq_table
+                # Insert using fq_store_table
                 pool = await memory._get_pool()
                 from hindsight_api.engine.db_utils import acquire_with_retry
 
                 async with acquire_with_retry(pool) as conn:
                     await conn.execute(
                         f"""
-                        INSERT INTO {fq_table("memory_units")} (bank_id, text, event_date, fact_type)
+                        INSERT INTO {fq_store_table("memory_units")} (bank_id, text, event_date, fact_type)
                         VALUES ($1, $2, now(), 'world')
                         """,
                         bank_id,

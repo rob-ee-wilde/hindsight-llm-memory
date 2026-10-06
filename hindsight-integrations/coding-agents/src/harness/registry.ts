@@ -64,6 +64,23 @@ export const HARNESS_NAMES = [
   "copilot-cli",
   "grok-build",
   "qwen-code",
+  // Factory Droid is a per-prompt HOOK host: the installer wires ~/.factory/hooks.json and the
+  // stdio MCP registration in ~/.factory/mcp.json (see src/installer.ts).
+  "factory-droid",
+  // ZCode is a per-prompt HOOK host too, registered in its own CLI config
+  // (~/.zcode/cli/config.json) under `hooks.events` — never the user's real Claude Code settings.
+  "zcode",
+  // TraeCode is a per-prompt HOOK host registered in ~/.trae-cn/hooks.json (see src/installer.ts).
+  "traecode",
+  "kimi-code",
+  // WorkBuddy is a per-prompt HOOK host too: the installer wires ~/.workbuddy/settings.json and
+  // the stdio MCP registration in ~/.workbuddy/mcp.json (see src/installer.ts).
+  "workbuddy",
+  // CodeBuddy Code is the SAME @genie/agent-cli HOOK host, one product config apart (WorkBuddy only
+  // renames the home folder): the installer wires ~/.codebuddy/settings.json and the stdio MCP
+  // registration in CodeBuddy's priority-chained MCP file (see src/installer.ts). The CLI
+  // writes WorkBuddy's transcript format; the CodeBuddy IDE has a reader of its own.
+  "codebuddy",
 ];
 
 const HOOK_BINS: Record<string, string> = {
@@ -76,6 +93,12 @@ const HOOK_BINS: Record<string, string> = {
   "copilot-cli": "hindsight-copilot-hook",
   "grok-build": "hindsight-grok-hook",
   "qwen-code": "hindsight-qwen-hook",
+  "factory-droid": "hindsight-droid-hook",
+  zcode: "hindsight-zcode-hook",
+  traecode: "hindsight-traecode-hook",
+  "kimi-code": "hindsight-kimi-hook",
+  workbuddy: "hindsight-workbuddy-hook",
+  codebuddy: "hindsight-codebuddy-hook",
   // more hook harnesses: add a HookSpec entry point (see src/cursor-hook.ts) + a registration here.
 };
 

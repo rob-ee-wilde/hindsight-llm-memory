@@ -222,7 +222,7 @@ const sidebars: SidebarsConfig = {
       items: [
         {
           type: 'link',
-          href: 'https://ui.hindsight.vectorize.io/signup',
+          href: 'https://ui.hindsight.vectorize.io',
           label: 'Cloud',
           customProps: { icon: 'lu-cloud', iconAfter: 'lu-arrow-up-right' },
         },
@@ -369,7 +369,7 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'link',
-          href: 'https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg',
+          href: 'https://vectorize.io/slack',
           label: 'Community',
           customProps: { icon: 'si-slack', iconAfter: 'lu-arrow-up-right' },
         },

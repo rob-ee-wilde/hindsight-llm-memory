@@ -138,6 +138,21 @@ pub struct FileRetainResult {
     pub operation_ids: Vec<String>,
 }
 
+/// Tag filter for the knowledge-base tree and search, with recall's semantics.
+#[derive(Debug, Default)]
+pub struct KnowledgeTagFilter {
+    pub tags: Vec<String>,
+    pub tags_match: Option<types::TagsMatch>,
+    /// JSON-encoded `tag_groups`, passed through as the query param the server parses.
+    pub tag_groups: Option<String>,
+}
+
+impl KnowledgeTagFilter {
+    fn tags(&self) -> Option<&Vec<String>> {
+        (!self.tags.is_empty()).then_some(&self.tags)
+    }
+}
+
 #[derive(Clone)]
 pub struct ApiClient {
     client: AsyncClient,
@@ -477,12 +492,15 @@ impl ApiClient {
                 .client
                 .list_documents(
                     agent_id,
+                    None, // end_date
                     limit.map(|l| l as u64),
                     offset.map(|o| o as u64),
                     q,
-                    None,
-                    None,
-                    None,
+                    None, // start_date
+                    None, // tags
+                    None, // tags_match
+                    None, // time_field
+                    None, // authorization
                 )
                 .humanized()
                 .await?;
@@ -581,13 +599,16 @@ impl ApiClient {
                     bank_id,
                     None, // consolidation_state
                     None, // document_id
+                    None, // end_date
                     None, // entity_id
                     limit.map(|l| l as u64),
                     offset.map(|o| o as u64),
                     q,
+                    None, // start_date
                     None, // state
                     None, // tags
                     None, // tags_match
+                    None, // time_field
                     type_filter,
                     None, // authorization
                 )
@@ -612,6 +633,9 @@ impl ApiClient {
                     limit.map(|l| l as u64),
                     offset.map(|o| o as u64),
                     None,
+                    None,
+                    None,
+                    None,
                 )
                 .humanized()
                 .await?;
@@ -628,7 +652,7 @@ impl ApiClient {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .get_entity(bank_id, entity_id, None)
+                .get_entity(bank_id, entity_id, None, None, None, None)
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -897,12 +921,21 @@ impl ApiClient {
     pub fn list_mental_models(
         &self,
         bank_id: &str,
-        _verbose: bool,
+        verbose: bool,
     ) -> Result<types::MentalModelListResponse> {
+        // The endpoint defaults to `metadata`, which omits the content this
+        // command previews (and that scripts read out of `--output json`), so
+        // ask for it explicitly. `--verbose` additionally pulls the heavyweight
+        // reflect_response provenance chains.
+        let detail = if verbose {
+            types::Detail::Full
+        } else {
+            types::Detail::Content
+        };
         self.runtime.block_on(async {
             let response = self
                 .client
-                .list_mental_models(bank_id, None, None, None, None, None, None)
+                .list_mental_models(bank_id, Some(detail), None, None, None, None, None)
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1027,12 +1060,19 @@ impl ApiClient {
     pub fn get_knowledge_base_tree(
         &self,
         bank_id: &str,
+        filter: &KnowledgeTagFilter,
         _verbose: bool,
     ) -> Result<types::KnowledgeTreeResponse> {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .get_knowledge_base_tree(bank_id, None)
+                .get_knowledge_base_tree(
+                    bank_id,
+                    filter.tag_groups.as_deref(),
+                    filter.tags(),
+                    filter.tags_match,
+                    None,
+                )
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1092,12 +1132,21 @@ impl ApiClient {
         bank_id: &str,
         query: &types::Q,
         limit: Option<std::num::NonZeroU64>,
+        filter: &KnowledgeTagFilter,
         _verbose: bool,
     ) -> Result<types::KnowledgePageSearchResponse> {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .search_knowledge_base(bank_id, limit, query, None)
+                .search_knowledge_base(
+                    bank_id,
+                    limit,
+                    query,
+                    filter.tag_groups.as_deref(),
+                    filter.tags(),
+                    filter.tags_match,
+                    None,
+                )
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1228,6 +1277,79 @@ impl ApiClient {
             let response = self
                 .client
                 .delete_directive(bank_id, directive_id, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    // --- Bank Alias Methods ---
+
+    pub fn list_bank_aliases(
+        &self,
+        bank_id: &str,
+        _verbose: bool,
+    ) -> Result<types::BankAliasesResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .list_bank_aliases(bank_id, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn create_bank_alias(
+        &self,
+        bank_id: &str,
+        alias: &str,
+        _verbose: bool,
+    ) -> Result<types::BankAliasesResponse> {
+        self.runtime.block_on(async {
+            let request = types::CreateBankAliasRequest {
+                alias: alias.to_string(),
+                // Added separately with `alias primary`, so creating one never
+                // silently changes which id the bank is displayed under.
+                primary: false,
+            };
+            let response = self
+                .client
+                .create_bank_alias(bank_id, None, &request)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn set_bank_alias_primary(
+        &self,
+        bank_id: &str,
+        alias: &str,
+        primary: bool,
+        _verbose: bool,
+    ) -> Result<types::BankAliasesResponse> {
+        self.runtime.block_on(async {
+            let request = types::SetBankAliasPrimaryRequest { primary };
+            let response = self
+                .client
+                .set_bank_alias_primary(bank_id, alias, None, &request)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn delete_bank_alias(
+        &self,
+        bank_id: &str,
+        alias: &str,
+        _verbose: bool,
+    ) -> Result<types::BankAliasesResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .delete_bank_alias(bank_id, alias, None)
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1434,9 +1556,11 @@ impl ApiClient {
         })
     }
 
-    /// Import a bank template manifest. The OpenAPI spec does not declare a
-    /// request body for this endpoint, so the progenitor-generated client does
-    /// not expose one — we POST the manifest JSON via raw HTTP instead.
+    /// Import a bank template manifest via the JSON endpoint.
+    ///
+    /// The CLI keeps using its direct HTTP path here so it can accept the
+    /// manifest as an untyped JSON value; the generated Rust client now also
+    /// exposes the typed request body from the OpenAPI schema.
     pub fn import_bank_template(
         &self,
         bank_id: &str,
